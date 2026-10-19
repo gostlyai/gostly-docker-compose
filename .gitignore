@@ -1,4 +1,4 @@
-# Your private settings and the secrets new-secrets.sh writes. Never commit them.
+# Your private settings and the secrets setup.sh writes. Never commit them.
 .env
 .env.*
 # Local Compose changes, so git pull stays clean on upgrade.

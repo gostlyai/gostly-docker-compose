@@ -4,8 +4,8 @@ This repository runs Gostly on your own machine with Docker Compose. Gostly sits
 services and the APIs they call: it records real traffic, then replays it as mocks you can
 control. The Lite stack runs the proxy, the control plane with its dashboard, and PostgreSQL.
 The Full stack adds the AI services that generate mocks. The images are private, so you need a
-Gostly account at https://gostly.ai for a licence key and a registry sign-in. The local secrets
-are generated on your machine and never leave it.
+Gostly account at https://gostly.ai for a licence key; the setup script uses the key to sign in
+to the image registry. The local secrets are generated on your machine and never leave it.
 
 This tree is not a tagged release. The image digests are listed under [Releases](#releases).
 
@@ -17,9 +17,8 @@ gostly-docker-compose/
 ├── .template.env             # the settings template; copy it to .env
 ├── docker-compose.full.yaml  # Full stack: Lite plus the AI services
 ├── docker-compose.yaml       # Lite stack (the default)
-├── LICENSE                   # licence placeholder
-├── new-secrets.sh            # writes the local secrets into .env
-└── README.md                 # this file
+├── README.md                 # this file
+└── setup.sh                  # fills .env, checks the key, signs in to the registry, starts the stack
 ```
 
 ## Services
@@ -53,9 +52,81 @@ services:
 
 ## Installation steps
 
-You need Docker with Compose v2 (`docker compose`), git, and a Gostly account. The Full stack
-needs Docker Engine 26 or later and enough memory for the limits of its AI containers (see
-[Resources](#resources)).
+You need Docker with Compose v2.22 or later (`docker compose`), git, curl, and a Gostly account.
+The Full stack needs Docker Engine 26 or later and enough memory for the limits of its AI
+containers (see [Resources](#resources)). `setup.sh` is a POSIX shell script for macOS and
+Linux; on Windows, run it inside WSL.
+
+1. Get the files and go into them.
+
+   ```bash
+   git clone https://github.com/gostlyai/gostly-docker-compose gostly-docker-compose && cd gostly-docker-compose
+   ```
+
+2. Run the setup script. It asks for your account values and your licence key, checks the key,
+   signs in to the Gostly registry with the key when an image is missing, and starts the stack.
+
+   ```bash
+   ./setup.sh
+   ```
+
+3. Open http://localhost:3000 and sign in with the email and password from step 2. The script's
+   last lines print the address, the email, and the password when it generated one.
+
+Then send a first request through the bundled demo upstream:
+`curl http://localhost:8080/gostly-demo/get`.
+
+### What setup.sh asks and does
+
+Every step is skipped when it is already done, so a second run changes nothing in `.env`.
+
+- **Settings file.** Copies `.template.env` to `.env`, readable only by you, when `.env` is
+  missing.
+- **Local secrets.** Generates `POSTGRES_PASSWORD`, `GOSTLY_APP_DB_PASSWORD`, `GOSTLY_SERVICE_DB_PASSWORD`, `GHOST_API_KEY` on this machine, once. They are never printed
+  and never replaced.
+- **Admin email.** Asks for the email you sign in with, suggesting your `git config user.email`,
+  and writes `GOSTLY_ADMIN_EMAIL`.
+- **Admin password.** Asks for a password of 12 to 72 characters without showing it, twice.
+  Press Enter instead to have it generate 24 characters, which it prints once, when the script
+  finishes or stops; it is also in `.env`. It writes `GOSTLY_ADMIN_PASSWORD`; a password you
+  chose is never printed.
+- **Licence key.** Asks for your key without showing it. Copy the key from your dashboard at
+  https://gostly.ai/dashboard, which shows it in full once, when you create or rotate it. It
+  writes `GOSTLY_LICENSE_KEY`.
+- **Key check and Workspace ID.** Sends the key to gostly.ai (`POST /v1/license/features`, a
+  check that takes no seat) and writes the Workspace ID it returns to `GOSTLY_TENANT_ID`, so you
+  never copy it. The Workspace ID keeps your data on one tenant when you rotate the key. A key
+  gostly.ai does not recognise, or one whose trial or subscription has ended, stops the script
+  before anything is downloaded. The check runs when the key is new or `GOSTLY_TENANT_ID` is
+  empty, so an update makes no call; a `GOSTLY_TENANT_ID` already in `.env` is never replaced.
+- **Lite or Full.** Asks once, suggesting Full when Docker has 20 GB of memory or more, and
+  writes `COMPOSE_FILE`.
+- **Registry login.** Only when an image is not on this machine yet. It asks gostly.ai for a
+  registry token with your licence key (`GET /v1/license/registry-credentials`; the key travels
+  in a request header, never on a command line) and hands the token to `docker login` on its
+  standard input. Nothing from it is stored by the script, and the login lasts 12 hours.
+- **Start.** Runs `docker compose pull` for the missing images and `docker compose up -d`, then
+  waits up to four minutes for every container to report healthy.
+
+`./setup.sh --help` lists the options: `--no-start` stops once `.env` is complete,
+`--non-interactive` lists the values `.env` still needs instead of asking, and
+`--skip-key-check` leaves out the call to gostly.ai (the stack then runs unlicensed if `.env`
+has no key).
+
+### Updating
+
+```bash
+git pull
+./setup.sh
+```
+
+The script skips the account steps, signs in to the registry with your key only when the new
+release has images this machine does not have, downloads them and restarts the stack. Your
+`.env` and your data stay as they are.
+
+### Manual steps
+
+The same install without `setup.sh`, for reference:
 
 1. Get the files.
 
@@ -76,23 +147,25 @@ needs Docker Engine 26 or later and enough memory for the limits of its AI conta
    cp .template.env .env
    ```
 
-4. Generate the local secrets: the three database passwords and the API key. Running it again
-   changes nothing.
+4. Generate the local secrets. Each database password is 64 hex characters and `GHOST_API_KEY`
+   is `gsk_svc_` and 43 URL-safe characters. Put each value on its empty line in `.env`:
 
    ```bash
-   ./new-secrets.sh
+   openssl rand -hex 32   # once for each of the three database passwords
+   printf 'gsk_svc_%s\n' "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"   # GHOST_API_KEY
    ```
 
 5. Edit `.env` and set the values listed under
-   [Required environment variable updates](#required-environment-variable-updates).
+   [Required environment variable updates](#required-environment-variable-updates), including
+   `GOSTLY_TENANT_ID`, your Workspace ID from Settings, Organization in your dashboard.
 
    ```bash
    "${EDITOR:-nano}" .env
    ```
 
-6. Sign in to the Gostly registry. In the dashboard at https://gostly.ai/dashboard, choose
-   **Get registry token** and run the command it shows. The token is valid for 12 hours and is
-   read from standard input, never passed as an argument. The command has this form:
+6. Sign in to the Gostly registry. In your dashboard, open **Installing by hand**, choose
+   **Copy registry login** and run the command. The token is valid for 12 hours and is read from
+   standard input, never passed as an argument. The command has this form:
 
    ```bash
    printf '%s' '<registry-token>' | docker login --username AWS --password-stdin 242201285974.dkr.ecr.us-east-1.amazonaws.com
@@ -113,25 +186,22 @@ needs Docker Engine 26 or later and enough memory for the limits of its AI conta
 9. Open http://localhost:3000 and sign in with your `GOSTLY_ADMIN_EMAIL` and
    `GOSTLY_ADMIN_PASSWORD`.
 
-Then send a first request through the bundled demo upstream:
-`curl http://localhost:8080/gostly-demo/get`.
-
 ## Required environment variable updates
 
-Set these in `.env` before the first `docker compose up -d`. Everything else has a working
-default.
+`setup.sh` fills these in `.env` before the first start; set them yourself only when you follow
+the manual steps. Everything else has a working default.
 
-| Variable | What to set | Where the value comes from |
-|---|---|---|
-| `GOSTLY_ADMIN_EMAIL` | Your sign-in email address | You choose it |
-| `GOSTLY_ADMIN_PASSWORD` | 12 to 72 characters, in single quotes if it has `$`, `#` or spaces | You choose it |
-| `GOSTLY_ADMIN_FULL_NAME` | Optional display name | You choose it |
-| `GOSTLY_AUTH_MODE` | Keep `password` | Already set in the template |
-| `GOSTLY_LICENSE_KEY` | Your full licence key | Your gostly.ai dashboard, shown once when the key is created or rotated |
-| `GOSTLY_TENANT_ID` | Your Workspace ID | Your gostly.ai dashboard: the Workspace ID in the Install block, and Settings, Organization |
+| Variable | What to set | Who sets it | Where the value comes from |
+|---|---|---|---|
+| `GOSTLY_ADMIN_EMAIL` | Your sign-in email address | setup.sh (asks you) | You choose it |
+| `GOSTLY_ADMIN_PASSWORD` | 12 to 72 characters, in single quotes if it has `$`, `#` or spaces | setup.sh (asks you, or generates it) | You choose it, or setup.sh generates it and prints it once |
+| `GOSTLY_ADMIN_FULL_NAME` | Optional display name | you | You choose it |
+| `GOSTLY_AUTH_MODE` | Keep `password` | you (already set) | Already set in the template |
+| `GOSTLY_LICENSE_KEY` | Your full licence key | setup.sh (asks you) | Your gostly.ai dashboard, shown once when the key is created or rotated |
+| `GOSTLY_TENANT_ID` | Your Workspace ID | setup.sh | Written by setup.sh from your key: gostly.ai returns the key's Workspace ID when it checks the key |
 
-`./new-secrets.sh` writes `POSTGRES_PASSWORD`, `GOSTLY_APP_DB_PASSWORD`, `GOSTLY_SERVICE_DB_PASSWORD`, `GHOST_API_KEY`. Do not edit or regenerate them on an existing
-install: the database volume keeps the passwords it started with.
+`setup.sh` writes `POSTGRES_PASSWORD`, `GOSTLY_APP_DB_PASSWORD`, `GOSTLY_SERVICE_DB_PASSWORD`, `GHOST_API_KEY`. Do not edit or regenerate them on an existing install: the
+database volume keeps the passwords it started with.
 
 ## Configuration
 
@@ -150,8 +220,8 @@ replaced on upgrade.
 ### Admin
 
 The first administrator of the local dashboard. The local sign-in page has no sign-up: this is
-the only way to create the first account, so set `GOSTLY_ADMIN_EMAIL` and
-`GOSTLY_ADMIN_PASSWORD` in `.env` before the first `docker compose up -d`. ghost-web creates the
+the only way to create the first account, so `setup.sh` asks for `GOSTLY_ADMIN_EMAIL` and
+`GOSTLY_ADMIN_PASSWORD` before the first start. ghost-web creates the
 account at the first start at which both are set and the database has no users; once it exists,
 later starts never change it. If they were empty at the first start, set both in `.env` and run
 `docker compose up -d` again, which recreates ghost-web with them and creates the account.
@@ -192,17 +262,20 @@ These connect the install to your Gostly account. Both stacks read them.
 
 #### `GOSTLY_LICENSE_KEY`
 
-Your full licence key. The dashboard shows it once, when you create the key; if you no longer
-have it, create a new key there. Without it, licensed features stay off.
+Your full licence key; `setup.sh` asks for it. The dashboard shows it once, when you create
+or rotate the key; if you no longer have it, rotate it there and run `./setup.sh` again after
+emptying this line. Without it, licensed features stay off.
 
 - Template value: empty
 - Default when unset: empty
 
 #### `GOSTLY_TENANT_ID`
 
-Your organization ID, which the gostly.ai dashboard calls the Workspace ID and shows in the
-Install block and under Settings, Organization. It keeps your data on one tenant when the
-licence key is rotated. It is not a secret. On an existing install, keep the value you have.
+Your organization ID, which the gostly.ai dashboard calls the Workspace ID and shows under
+Settings, Organization. `setup.sh` writes it from your licence key: gostly.ai returns the key's
+Workspace ID when it checks the key. It keeps your data on one tenant when the licence key is
+rotated, because a Gostly licence key does not carry it. It is not a secret. On an existing
+install, keep the value you have; `setup.sh` never replaces it.
 
 - Template value: empty
 - Default when unset: empty
@@ -256,8 +329,8 @@ so moving that port breaks the dashboard. If another program uses port 8000, sto
 
 An override in `docker-compose.override.yaml` (git-ignored) still works for other changes.
 Use `ports: !override` there, because a plain `ports:` list is added to the published ports
-rather than replacing them (Compose 2.24.4 or later). With `COMPOSE_FILE` set, add the
-override to that line, for example
+rather than replacing them (Compose 2.24.4 or later). With `COMPOSE_FILE` set (`setup.sh`
+writes it, and lists an override file that exists when it does), add the override to that line, for example
 `COMPOSE_FILE=docker-compose.full.yaml:docker-compose.override.yaml`; otherwise Compose
 ignores it.
 
@@ -404,7 +477,7 @@ The largest MCP request body accepted, 1 KiB to 1 MiB.
 
 ### Generated secrets
 
-`./new-secrets.sh` fills each of these once, only when its line is present and empty, and never
+`./setup.sh` fills each of these once, only when its line is present and empty, and never
 prints a value. The database passwords are 64 hex characters; `GHOST_API_KEY` is `gsk_svc_`
 and 43 URL-safe characters. Send the key as the `X-API-Key` header on API calls to port 8000.
 If you delete the `GHOST_API_KEY` line before the first start, the dashboard manages the key
@@ -446,19 +519,17 @@ docker compose down                            # stop and remove containers; dat
 
 Never add `-v` to `down` unless you mean to delete every recording, mock and database row.
 
-**Lite or Full.** `docker compose` reads `docker-compose.yaml` (Lite) by default. To run the Full
-stack, uncomment `COMPOSE_FILE=docker-compose.full.yaml` in `.env`; every command above then
-uses it. Check with `docker compose config --services`, then run `docker compose up -d`. To go
-back to Lite, comment the line out again and run `docker compose up -d --remove-orphans`, which
-removes the AI containers.
+**Lite or Full.** `setup.sh` asks once and writes `COMPOSE_FILE` in `.env`; every command above
+then uses that file. To switch later, set `COMPOSE_FILE=docker-compose.full.yaml` (Full) or
+`COMPOSE_FILE=docker-compose.yaml` (Lite) and check with `docker compose config --services`.
+Then run `docker compose up -d`, adding `--remove-orphans` when you go back to Lite so the AI
+containers are removed.
 
 **Upgrade.** Your `.env` stays as it is:
 
 ```bash
 git pull                     # or: git fetch --tags && git checkout <release tag>
-printf '%s' '<registry-token>' | docker login --username AWS --password-stdin 242201285974.dkr.ecr.us-east-1.amazonaws.com
-docker compose pull
-docker compose up -d
+./setup.sh
 ```
 
 ## Deploy
@@ -517,6 +588,30 @@ curl -fsS http://localhost:8080/health   # the proxy
 
 ## Troubleshooting
 
+### If setup.sh stops
+
+- *gostly.ai does not recognise this key*: the key is mistyped, revoked, expired, or belongs to
+  another Gostly account. The script empties `GOSTLY_LICENSE_KEY` in `.env`; create or rotate a
+  key at https://gostly.ai/dashboard and run `./setup.sh` again.
+- *this key's trial or subscription has ended*: renew at https://gostly.ai, then run
+  `./setup.sh` again.
+- *could not check the key*: gostly.ai was not reachable. Check the connection, or run
+  `./setup.sh --skip-key-check` and set `GOSTLY_TENANT_ID` yourself (Settings, Organization).
+- *gostly.ai did not accept this licence key for the image registry*: the key in `.env` is
+  mistyped, revoked, expired, or from another account. Create or rotate a key at
+  https://gostly.ai/dashboard, replace `GOSTLY_LICENSE_KEY` in `.env`, keep `GOSTLY_TENANT_ID`,
+  and run `./setup.sh` again.
+- *gostly.ai is still rate limiting registry sign-ins*: the script already waited a minute and
+  tried once more. Wait a few minutes and run `./setup.sh` again.
+- *Could not get a registry sign-in from gostly.ai*: the script then asks for the registry
+  login command instead. In your dashboard, open **Installing by hand**, choose **Copy registry
+  login** and paste the command at the prompt; it is not shown, and only that exact command, for
+  the registry these Compose files use, is run. Press Enter instead if you are signed in already.
+- *that is not the registry login command*: copy it again with **Copy registry login** and
+  paste the whole line. Registry logins last 12 hours.
+- *still empty in .env*: you ran it with `--non-interactive`; set the named values in `.env`,
+  or run it in a terminal to be asked.
+
 ### If the dashboard does not load
 
 1. See which container is not running: `docker compose ps -a`. ghost-web waits for
@@ -563,16 +658,100 @@ curl -fsS http://localhost:8080/health   # the proxy
    Put `COMPOSE_PROFILES=demo` back and run `docker compose up -d`, or set `BACKEND_URL` to your
    own service.
 
+## Common issues
+
+Each entry gives the symptom, its cause and the fix. Run the commands from this directory.
+
+### Sign-in fails in Safari or another WebKit browser
+
+- **Symptom:** on a plain-http install such as http://localhost:3000, the local sign-in page takes
+  your email and password and then shows the sign-in page again.
+- **Cause:** the session cookie is marked `Secure` by default, and WebKit browsers do not keep
+  a Secure cookie over plain http. The default assumes Chrome or Firefox on `localhost`.
+- **Fix:** set `GOSTLY_AUTH_COOKIE_SECURE=false` in `.env`, then restart ghost-web with
+  `docker compose up -d ghost-web`.
+
+### The local sign-in page accepts no account
+
+- **Symptom:** every email and password is refused, and
+  `docker compose logs ghost-web | grep auth_admin_bootstrapped` prints nothing.
+- **Cause:** `GOSTLY_ADMIN_EMAIL` or `GOSTLY_ADMIN_PASSWORD` was empty at the first start, so no
+  account was created.
+- **Fix:** set both in `.env` and run `docker compose up -d` again. The account is created on
+  the next start when the database has no users.
+
+### The dashboard says the key is not recognised, or the proxy logs 401
+
+- **Symptom:** the local dashboard reports that gostly.ai does not recognise the licence key,
+  or `docker compose logs ghost-proxy` shows a 401 from the license server.
+- **Cause:** the key is mistyped, revoked, expired, or from another Gostly account.
+- **Fix:** create or rotate a key at https://gostly.ai/dashboard, replace `GOSTLY_LICENSE_KEY`
+  in `.env` with it, keep `GOSTLY_TENANT_ID` as it is, and run `docker compose up -d`.
+
+### The proxy reports the licence seat in use
+
+- **Symptom:** after a reinstall, or on a second machine, `docker compose logs ghost-proxy`
+  shows *licence seat in use* (the license server's `seat_limit_exceeded`), and customer
+  traffic stays locked.
+- **Cause:** a trial has one seat, and the earlier install still holds it.
+- **Fix:** wait for the seat to lapse, 24 hours after the earlier install was last seen (the
+  proxy retries every minute), or revoke and rotate the key at https://gostly.ai/dashboard and
+  put the new key in `.env`.
+
+### The registry login expired
+
+- **Symptom:** `docker compose pull` fails with an authorization error.
+- **Cause:** registry logins last 12 hours.
+- **Fix:** run `./setup.sh` again; it signs in with your key before it downloads.
+
+### A port is in use
+
+- **Symptom:** `docker compose up -d` fails with *port is already allocated* or *address already
+  in use*.
+- **Cause:** another program uses 3000, 8080 or 8000 on this machine.
+- **Fix:** set `GOSTLY_WEB_PORT` and `GOSTLY_PROXY_PORT` in `.env`, with `ALLOWED_ORIGINS` and
+  `MCP_ALLOWED_ORIGINS` naming the new dashboard address (see [Ports](#ports)). Port 8000 must
+  stay free, because the dashboard calls `http://localhost:8000`.
+
+### An override file is ignored
+
+- **Symptom:** a change in `docker-compose.override.yaml` has no effect.
+- **Cause:** `COMPOSE_FILE` in `.env` names the Full file (or the Lite file), and with
+  `COMPOSE_FILE` set Compose reads only the files it lists.
+- **Fix:** list the override too, for example
+  `COMPOSE_FILE=docker-compose.full.yaml:docker-compose.override.yaml`, and run
+  `docker compose up -d`.
+
+### The containers cannot connect to the database after .env was replaced
+
+- **Symptom:** ghost-migrate exits with an error and the logs show
+  `alembic_migrations_failed` or a password authentication failure.
+- **Cause:** `.env` was regenerated or copied from `.template.env` over an existing install, so
+  the database passwords changed, while the database volume keeps the ones it started with.
+- **Fix:** restore the old `.env` from a backup and run `docker compose up -d`. Never run
+  `cp .template.env .env` on an existing install.
+
+### The Full stack fails to start for memory
+
+- **Symptom:** an AI container of the Full stack exits or restarts, or Docker reports that it
+  cannot allocate memory.
+- **Cause:** Docker Desktop has less than about 20 GB of memory.
+- **Fix:** raise it in Docker Desktop under Settings, Resources, or use the Lite stack (see
+  [Resources](#resources)).
+
 ## Upgrading
 
 An upgrade changes the Compose files, never your `.env`: keep it, and keep your volumes.
 
 ```bash
 git pull
-printf '%s' '<registry-token>' | docker login --username AWS --password-stdin 242201285974.dkr.ecr.us-east-1.amazonaws.com
-docker compose pull
-docker compose up -d
+./setup.sh
 ```
+
+`setup.sh` signs in to the registry with your key only when the new release has an image this
+machine does not have. Without the script, sign in with the command from **Installing by hand**,
+**Copy registry login** in your dashboard, then run `docker compose pull` and
+`docker compose up -d`.
 
 What changes between releases is the set of image digests in the Compose files, plus any new
 settings. `git diff <old tag> <new tag>` shows both. When `.template.env` gains a line, copy that
@@ -818,8 +997,3 @@ by the Compose file.
 Gostly's source tree has a separate Compose stack, `quickstarts/customer-compose/`, for
 development, end-to-end tests and evaluators. It differs from these files in several defaults
 and is not an install path. Install from this repository.
-
-## Licence
-
-The licence for this repository is to be chosen by its owner; see `LICENSE`. The Gostly images
-are distributed under their own terms.
