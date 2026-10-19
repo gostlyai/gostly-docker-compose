@@ -235,10 +235,13 @@ services:
     cap_drop:
       - ALL
     ports:
-      - "3000:3000"
+      # Dashboard host port: GOSTLY_WEB_PORT in .env, default 3000. If you change it,
+      # set ALLOWED_ORIGINS and MCP_ALLOWED_ORIGINS to http://localhost:<that port>.
+      - "${GOSTLY_WEB_PORT:-3000}:3000"
       # API control plane: loopback only. Docker publishes past host firewalls,
       # so a bare 8000:8000 would expose it to every routable interface. Publish
       # it deliberately (for example behind a reverse proxy) for multi-host use.
+      # Keep host port 8000: the dashboard in this image calls http://localhost:8000.
       - "127.0.0.1:8000:8000"
     environment:
       GOSTLY_CONNECTED_AI_AUTHORITY_DIR: /var/lib/gostly/connected-ai
@@ -461,7 +464,8 @@ services:
     cap_drop:
       - ALL
     ports:
-      - "8080:8080"
+      # Proxy host port: GOSTLY_PROXY_PORT in .env, default 8080.
+      - "${GOSTLY_PROXY_PORT:-8080}:8080"
     environment:
       GOSTLY_LICENSE_KEY:      ${GOSTLY_LICENSE_KEY:-}
       BACKEND_URL:             ${BACKEND_URL:?BACKEND_URL must be set in .env}

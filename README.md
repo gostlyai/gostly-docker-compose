@@ -231,19 +231,35 @@ to start without it.
 
 ### Ports
 
-The published ports are fixed in the Compose files rather than read from `.env`:
-
 | Service | Host | Container | What |
 |---|---|---|---|
-| ghost-web | `3000` | `3000` | the dashboard |
+| ghost-web | `${GOSTLY_WEB_PORT:-3000}` | `3000` | the dashboard |
 | ghost-web | `127.0.0.1:8000` | `8000` | the API, loopback only |
-| ghost-proxy | `8080` | `8080` | the proxy |
+| ghost-proxy | `${GOSTLY_PROXY_PORT:-8080}` | `8080` | the proxy |
 
-To publish on other host ports, put an override in `docker-compose.override.yaml` (git-ignored,
-so `git pull` stays clean). Compose reads it automatically next to `docker-compose.yaml`; with
-`COMPOSE_FILE` set, add it to that line, for example
-`COMPOSE_FILE=docker-compose.full.yaml:docker-compose.override.yaml`. `!override` replaces the
-list instead of adding to it (Compose 2.24.4 or later):
+The dashboard and proxy host ports are read from `.env`; leave them unset to keep 3000 and 8080.
+To use other ports, for example when 3000 is taken, set these four lines in `.env` (it already
+has an `MCP_ALLOWED_ORIGINS` line: change that one):
+
+```sh
+GOSTLY_WEB_PORT=3001
+GOSTLY_PROXY_PORT=8081
+ALLOWED_ORIGINS=http://localhost:3001
+MCP_ALLOWED_ORIGINS=http://localhost:3001
+```
+
+then run `docker compose up -d`. The two origin lines must name the dashboard's new address
+exactly, or the dashboard cannot reach the API. Point your clients at the new proxy port.
+
+The API stays on `127.0.0.1:8000`: the dashboard in this image calls `http://localhost:8000`,
+so moving that port breaks the dashboard. If another program uses port 8000, stop it first.
+
+An override in `docker-compose.override.yaml` (git-ignored) still works for other changes.
+Use `ports: !override` there, because a plain `ports:` list is added to the published ports
+rather than replacing them (Compose 2.24.4 or later). With `COMPOSE_FILE` set, add the
+override to that line, for example
+`COMPOSE_FILE=docker-compose.full.yaml:docker-compose.override.yaml`; otherwise Compose
+ignores it.
 
 ```yaml
 services:
@@ -252,9 +268,6 @@ services:
       - "3001:3000"
       - "127.0.0.1:8000:8000"
 ```
-
-If the dashboard moves to another URL, also set `ALLOWED_ORIGINS` and `MCP_ALLOWED_ORIGINS` in
-`.env` to that exact origin, for example `http://localhost:3001`.
 
 ### Resources
 
@@ -635,6 +648,7 @@ uses when it is unset. `required` means Compose refuses to start without it.
 | `GOSTLY_OIDC_SCOPES` | `openid email profile groups` | no | yes |
 | `GOSTLY_OUTPUT_BUDGET` | `2048` | no | yes |
 | `GOSTLY_PREWARM_TIMEOUT_S` | `120` | no | yes |
+| `GOSTLY_PROXY_PORT` | `8080` | yes | yes |
 | `GOSTLY_SAML_EMAIL_ATTRIBUTE` | `email` | no | yes |
 | `GOSTLY_SAML_GROUP_ATTRIBUTE` | `memberOf` | no | yes |
 | `GOSTLY_SAML_IDP_METADATA_URL` | empty | no | yes |
@@ -646,6 +660,7 @@ uses when it is unset. `required` means Compose refuses to start without it.
 | `GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED` | `false` | yes | yes |
 | `GOSTLY_TELEMETRY` | empty | yes | yes |
 | `GOSTLY_TENANT_ID` | empty | yes | yes |
+| `GOSTLY_WEB_PORT` | `3000` | yes | yes |
 | `INFERENCE_CPU_LIMIT` | `4` | no | yes |
 | `INFERENCE_NUM_THREADS` | `4` | no | yes |
 | `INITIAL_MODE` | `LEARN` | yes | yes |
