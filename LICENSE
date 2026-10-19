@@ -1,0 +1,6 @@
+The licence for the files in this repository (the Compose files, the environment
+template, the README and new-secrets.sh) has not been chosen yet. The owner will
+choose it before the repository is published.
+
+The Gostly container images these files reference are not covered by this file.
+They are distributed under their own terms.

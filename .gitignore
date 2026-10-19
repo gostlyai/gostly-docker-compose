@@ -1,0 +1,6 @@
+# Your private settings and the secrets new-secrets.sh writes. Never commit them.
+.env
+.env.*
+# Local Compose changes, so git pull stays clean on upgrade.
+docker-compose.override.yaml
+docker-compose.override.yml

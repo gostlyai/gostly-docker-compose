@@ -1,0 +1,385 @@
+# Gostly AI — Self-hosted proxy (Lite)
+#
+# This is the Lite stack: proxy + control plane + Postgres. No AI
+# services (no ghost-inference, no ghost-llamacpp, no llama-isolated
+# network). Pro trials default to this topology. License capabilities are
+# unchanged. Workspaces with the Full stack enabled can choose it in the
+# dashboard or with the install download's ?variant=full.
+#
+# Prerequisites:
+#   1. Get your license key from https://gostly.ai/dashboard.
+#   2. Follow the dashboard's registry sign-in instructions (--password-stdin).
+#   3. Keep your private .env alongside this file and fill in
+#      GOSTLY_LICENSE_KEY. Preserve existing database passwords and tenant ID.
+#      A fresh .env starts on the bundled demo upstream (COMPOSE_PROFILES=demo
+#      with BACKEND_URL=http://gostly-demo-upstream:8080); its comments say how
+#      to switch BACKEND_URL to your own service.
+#   4. Run: docker compose up
+
+services:
+
+  ghost-postgres:
+    image: postgres:16-alpine
+    container_name: ghost-postgres
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-ghost}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB:       ${POSTGRES_DB:-ghost}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ghost} -d ${POSTGRES_DB:-ghost}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-shot schema authority. It uses the exact same image as ghost-web,
+  # applies the sole Alembic head and initializes the shared service key, then
+  # exits before the serving process starts.
+  ghost-migrate:
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:426bf865655543689d472d14e574d1c6f7d9a97711adbd8dd11742596e10e170
+    container_name: ghost-migrate
+    # No privilege gain after start, and no Linux capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Run the image's unchanged migration entrypoint first. Tini forwards stop
+    # signals to the whole child process group, including the migration worker.
+    # Only a successful migration may initialize the shared credential before
+    # either API worker starts. The image remains identical to ghost-web.
+    entrypoint: ["/usr/bin/tini", "-g", "--", "/bin/sh", "-ec"]
+    command:
+      - |
+        /app/ghost-web-entrypoint.sh
+        . /app/ghost-web-scrub-migration-env.sh
+        cd /app/api
+        exec python - <<'PYKEY'
+        import json
+        import os
+        import secrets
+        import stat
+        import sys
+        from pathlib import Path
+        import service_key
+
+        path = Path(os.environ.get("DATA_DIR", "/data")) / "service.key"
+        pinned = os.environ.get("GHOST_API_KEY", "").strip()
+        # "ready" must mean the API's production start check will accept this
+        # file, so both decisions below ask the API's own reader.
+        REMOVE_KEY = "docker compose run --rm --no-deps --entrypoint rm ghost-web /data/service.key"
+        UNMANAGED = (
+            "ghost-migrate refused: /data/service.key holds a key that is not "
+            "installer-generated (for example a legacy key or an earlier pin), and "
+            "GHOST_API_KEY is not set. The file was left unchanged. To keep that key, "
+            "set GHOST_API_KEY to that exact value in single quotes in .env. To replace "
+            "it, run: " + REMOVE_KEY + "   then: docker compose up -d"
+        )
+        MISMATCHED = (
+            "ghost-migrate refused: /data/service.key holds a key that is not "
+            "installer-generated (for example a legacy key or an earlier pin), and "
+            "GHOST_API_KEY is set to a different value, so continuing would overwrite it. "
+            "The file was left unchanged. If you meant to keep the existing key, set "
+            "GHOST_API_KEY to that exact value in single quotes in .env; one possible "
+            "cause of a difference is that Compose rewrites some unquoted .env values. "
+            "If you meant to change it, run: " + REMOVE_KEY + "   then: docker compose up -d"
+        )
+        OLD_IMAGE = (
+            "ghost-migrate refused: this web image predates managed-key support, so "
+            "ghost-web would not start in production with the key created here. "
+            "Run: docker compose pull   then: docker compose up -d"
+        )
+        CHECK_UNAVAILABLE = (
+            "ghost-migrate refused: this web image's production start check could not "
+            "be run ({reason}), so ghost-web is not expected to start. The service key "
+            "is kept. Run: docker compose pull   then: docker compose up -d"
+        )
+        UNUSABLE = (
+            "ghost-migrate refused: /data/service.key could not be used safely "
+            "({reason}). /data must be a directory writable by UID {uid}, and "
+            "service.key a regular file owned by that user with mode 0600, not a link."
+        )
+        KNOWN_REASONS = {"unsafe_service_key", "service_key_changed",
+                         "invalid_service_key", "service_key_disagrees"}
+
+        class Explained(ValueError):
+            """The reason is already on stderr."""
+
+        def refuse(message):
+            print(message, file=sys.stderr, flush=True)
+            raise Explained()
+
+        def read_private_key(missing_ok=False):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+            except FileNotFoundError:
+                if missing_ok:
+                    return None
+                raise
+            try:
+                before = os.fstat(fd)
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                        or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                        or not 0 < before.st_size <= 512):
+                    raise ValueError("unsafe_service_key")
+                raw = os.read(fd, 513)
+                after = os.fstat(fd)
+                named = path.stat(follow_symlinks=False)
+                identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+                if identity(before) != identity(after) or identity(after) != identity(named):
+                    raise ValueError("service_key_changed")
+                key = raw.decode("ascii").strip()
+                if not key or any(not 0x21 <= ord(char) <= 0x7e for char in key):
+                    raise ValueError("invalid_service_key")
+                os.fsync(fd)
+                return key
+            finally:
+                os.close(fd)
+
+        def is_managed_key_file():
+            """The API reader's verdict on the file's shape, as if unpinned: under
+            a pin it only reports whether the file equals the pin."""
+            hidden = os.environ.pop("GHOST_API_KEY", None)
+            try:
+                return persisted_key() is not None
+            finally:
+                if hidden is not None:
+                    os.environ["GHOST_API_KEY"] = hidden
+
+        try:
+            persisted_key = getattr(service_key, "get_persisted_current_key", None)
+            if persisted_key is None:
+                refuse(OLD_IMAGE)
+            original = read_private_key(missing_ok=True)
+            if original is not None and not is_managed_key_file():
+                # A key this installer did not create is kept or refused, never
+                # replaced: only an exactly equal pin may proceed.
+                if not pinned:
+                    refuse(UNMANAGED)
+                if not secrets.compare_digest(original.encode(), pinned.encode()):
+                    refuse(MISMATCHED)
+            service_key.init_service_key()
+            persisted = read_private_key()
+            current = service_key.get_current_key()
+            expected = pinned or original or current
+            if (not secrets.compare_digest(persisted, current)
+                    or not secrets.compare_digest(persisted, expected)
+                    or persisted_key() is None):
+                raise ValueError("service_key_disagrees")
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            # Run this image's own production start check, so an image that would
+            # refuse is reported once here rather than by ghost-web restarting. It
+            # matches ghost-web's decision only while GHOST_API_KEY, ENVIRONMENT
+            # and DATA_DIR are the same on both services. This file gives both
+            # the same values; an override that changes one alone is not
+            # detected here.
+            try:
+                import deps
+                production_check = deps.verify_production_config
+            except Exception as exc:
+                refuse(CHECK_UNAVAILABLE.format(reason=type(exc).__name__))
+            try:
+                production_check()
+            except RuntimeError:
+                refuse(OLD_IMAGE)
+            except Exception as exc:
+                refuse(CHECK_UNAVAILABLE.format(reason=type(exc).__name__))
+            # The Full stack's ghost-llamacpp mounts this subdirectory of the data
+            # volume read-only, and Docker mounts only an existing subpath.
+            (path.parent / "models" / "adapters").mkdir(mode=0o755, parents=True, exist_ok=True)
+        except (OSError, UnicodeError, ValueError) as exc:
+            if not isinstance(exc, Explained):
+                # Never print the text of an OS or decoding error: it can quote file
+                # content. It is compared against the fixed reasons, nothing more.
+                reason = str(exc) if str(exc) in KNOWN_REASONS else type(exc).__name__
+                print(UNUSABLE.format(reason=reason, uid=os.geteuid()), file=sys.stderr, flush=True)
+            print(json.dumps({"event": "installer_service_key_bootstrap", "status": "failed"}), flush=True)
+            raise SystemExit(2) from None
+        print(json.dumps({"event": "installer_service_key_bootstrap", "status": "ready"}), flush=True)
+        PYKEY
+    volumes:
+      - gostly-data:/data
+    environment:
+      GOSTLY_MIGRATION_MODE: migrate
+      # Matches ghost-web so the bootstrap can run this image's own production
+      # start check against the key it just persisted. Migrations ignore it.
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      # Optional operator pin, from .env. ghost-web below receives the same
+      # value: the two must agree or they disagree about the key file. Blank
+      # means unpinned, and the job creates a managed key.
+      GHOST_API_KEY: ${GHOST_API_KEY:-}
+      GOSTLY_REQUIRE_DISTINCT_DB_CREDENTIALS: "1"
+      MIGRATIONS_DATABASE_URL: ${MIGRATIONS_DATABASE_URL:-postgresql://${POSTGRES_USER:-ghost}:${POSTGRES_PASSWORD}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+      GOSTLY_APP_DB_PASSWORD: ${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set and differ from POSTGRES_PASSWORD}
+      GOSTLY_SERVICE_DB_PASSWORD: ${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set and differ from the other database passwords}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://gostly_app:${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+      SERVICE_DATABASE_URL: ${SERVICE_DATABASE_URL:-postgresql://gostly_service:${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+    depends_on:
+      ghost-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  ghost-web:
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:426bf865655543689d472d14e574d1c6f7d9a97711adbd8dd11742596e10e170
+    container_name: ghost-web
+    # No privilege gain after start, and no Linux capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "3000:3000"
+      # API control plane: loopback only. Docker publishes past host firewalls,
+      # so a bare 8000:8000 would expose it to every routable interface. Publish
+      # it deliberately (for example behind a reverse proxy) for multi-host use.
+      - "127.0.0.1:8000:8000"
+    environment:
+      GOSTLY_MIGRATION_MODE: skip
+      # Production posture by default: the development authentication bypass is
+      # ignored and logs are structured. The API starts only once ghost-migrate
+      # has created the shared service credential in the data volume.
+      ENVIRONMENT:          ${ENVIRONMENT:-production}
+      LOG_FORMAT:           ${LOG_FORMAT:-json}
+      # Optional operator pin, identical to ghost-migrate's. When set it is the
+      # service key: it is mirrored to /data/service.key (which ghost-proxy
+      # reads, so the proxy is not wired), it is visible in this container's
+      # metadata, its format is not validated, and key rotation is refused.
+      GHOST_API_KEY:        ${GHOST_API_KEY:-}
+      GOSTLY_LICENSE_KEY:   ${GOSTLY_LICENSE_KEY:-}
+      # Optional stable tenant pin. Installer-generated .env files set this
+      # to the platform organization UUID; empty preserves legacy/manual use.
+      GOSTLY_TENANT_ID:     ${GOSTLY_TENANT_ID:-}
+      TRAINING_VERSION_ARCHIVE_ENABLED: ${TRAINING_VERSION_ARCHIVE_ENABLED:-false}
+      ACTIVITIES_V2_ENABLED: ${ACTIVITIES_V2_ENABLED:-false}
+      # Time Chamber API mutations: snapshot, fork and reset through this
+      # service's REST routes (POST /v1/time-chamber/...) and the keyed MCP
+      # episode tools. Off by default; while false those calls are refused
+      # before any database or agent access. ghost-proxy's own /ghost/* episode
+      # routes on port 8080 do not need it. Set true in .env only once this
+      # ghost-web runs the upgraded image (pull and recreate it first, still
+      # false), then recreate ghost-web.
+      GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED: ${GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED:-false}
+      # Telemetry opt-out passthrough — set GOSTLY_TELEMETRY=off in .env to
+      # disable the api's daily dashboard-funnel shipper, the same lever
+      # that disables the agent's shipper (see .env.example).
+      GOSTLY_TELEMETRY:     ${GOSTLY_TELEMETRY:-}
+      AGENT_URL:            http://ghost-proxy:8080
+      API_BASE_URL:         http://ghost-web:8000
+      MOCK_DIR:             /data/mocks
+      TRAFFIC_LOG_DIR:      /data/traffic
+      ALLOWED_ORIGINS:      ${ALLOWED_ORIGINS:-http://localhost:3000}
+      # Match the Full topology's exact local dashboard Origin boundary.
+      # MCP remains license-gated; these settings do not grant the feature.
+      MCP_ALLOWED_ORIGINS:  ${MCP_ALLOWED_ORIGINS:-http://localhost:3000}
+      MCP_MAX_REQUEST_BODY_BYTES: ${MCP_MAX_REQUEST_BODY_BYTES:-1048576}
+      # Runtime connections use only the non-owner roles created by the
+      # short-lived ghost-migrate job. Owner/bootstrap values are deliberately
+      # absent from this long-lived container's environment and metadata.
+      DATABASE_URL:         ${DATABASE_URL:-postgresql://gostly_app:${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+      SERVICE_DATABASE_URL: ${SERVICE_DATABASE_URL:-postgresql://gostly_service:${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+      GOSTLY_AUTH_MODE:                ${GOSTLY_AUTH_MODE:-password}
+      GOSTLY_ADMIN_EMAIL:              ${GOSTLY_ADMIN_EMAIL:-}
+      GOSTLY_ADMIN_PASSWORD:           ${GOSTLY_ADMIN_PASSWORD:-}
+      GOSTLY_ADMIN_FULL_NAME:          ${GOSTLY_ADMIN_FULL_NAME:-}
+      GOSTLY_AUTH_SESSION_TTL_HOURS:   ${GOSTLY_AUTH_SESSION_TTL_HOURS:-12}
+      GOSTLY_AUTH_COOKIE_SECURE:       ${GOSTLY_AUTH_COOKIE_SECURE:-true}
+      GOSTLY_AUTH_COOKIE_DOMAIN:       ${GOSTLY_AUTH_COOKIE_DOMAIN:-}
+    volumes:
+      - gostly-data:/data
+    depends_on:
+      ghost-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  ghost-proxy:
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/proxy@sha256:d614b119ac4380aaaa0142c63071bfc3e0ebc63340cb1dbba45dcf3e777e1aec
+    container_name: ghost-proxy
+    # No privilege gain after start, and no Linux capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "8080:8080"
+    environment:
+      GOSTLY_LICENSE_KEY:      ${GOSTLY_LICENSE_KEY:-}
+      BACKEND_URL:             ${BACKEND_URL:?BACKEND_URL must be set in .env}
+      INITIAL_MODE:            ${INITIAL_MODE:-LEARN}
+      PROXY_PORT:              "8080"
+      MOCK_DIR:                /data/mocks
+      MODE_FILE_PATH:          /data/mode.txt
+      AI_CONFIDENCE_THRESHOLD: ${AI_CONFIDENCE_THRESHOLD:-0.70}
+      ACCEPT_INVALID_CERTS:    ${ACCEPT_INVALID_CERTS:-false}
+      REDACT_HEADERS:          ${REDACT_HEADERS:-Authorization,Cookie,X-Api-Key}
+      API_URL:                 http://ghost-web:8000
+      TRAFFIC_LOG_DIR:         /data/traffic
+      # Telemetry opt-out passthrough — set GOSTLY_TELEMETRY=off in .env to
+      # disable the shipper entirely (see .env.example).
+      GOSTLY_TELEMETRY:        ${GOSTLY_TELEMETRY:-}
+      # Time Chamber: deterministic episodes with snapshot/reset and a virtual
+      # clock, driven through this port's /ghost/* routes with the service key.
+      # On by default; set GOSTLY_EPISODES=0 in .env to turn it off. Live
+      # episodes and snapshots end when this container restarts. Their journals
+      # and snapshot artifacts are written to the data volume below.
+      GOSTLY_EPISODES:         ${GOSTLY_EPISODES:-1}
+      # Fixed unsigned 64-bit chaos seed. A snapshot is refused while chaos can
+      # apply in MOCK and no seed is set; it also seeds chaos outside episodes.
+      CHAOS_SEED:              ${CHAOS_SEED:-}
+      TRAJECTORY_DIR:          /data/trajectories
+      SNAPSHOT_ARTIFACT_DIR:   /data/snapshots
+    volumes:
+      - gostly-data:/data
+    depends_on:
+      ghost-web:
+        condition: service_healthy
+    restart: unless-stopped
+    # /health, not /readyz: /readyz fails once a trial or subscription lapses.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Bundled demo upstream, so a first install can record and replay without a
+  # service of its own. It starts only when the demo profile is active; the
+  # downloaded .env does that with COMPOSE_PROFILES=demo, next to the
+  # BACKEND_URL that points at it, so the two always change together. No other
+  # service waits on it and it publishes no port. It answers only under the
+  # PREFIX path (404 elsewhere), so every demo request, capture and mock path
+  # starts with /gostly-demo/ and never matches your own service's paths; the
+  # demo host name is gostly-demo-upstream. The image has no shell or HTTP
+  # client, so it carries no healthcheck.
+  gostly-demo-upstream:
+    image: mccutchen/go-httpbin:v2.15.0@sha256:24528cf5229d0b70065ac27e6c9e4d96f5452a84a3ce4433e56573c18d96827a
+    container_name: gostly-demo-upstream
+    profiles: ["demo"]
+    user: "65534:65534"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PORT:   "8080"
+      PREFIX: /gostly-demo
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  # Recordings, mocks and the service key. Docker creates it from the first
+  # mounting image's /data: ghost-migrate (the web image) runs before every
+  # other user, so it starts owned by UID 10001 (#1296).
+  gostly-data:
