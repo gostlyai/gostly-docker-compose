@@ -1,6 +1,10 @@
 # Your private settings and the secrets setup.sh writes. Never commit them.
 .env
 .env.*
+# Files the settings name by path (CA bundle, sign-in secrets), mounted at /etc/gostly/files.
+files/
+# Backups the README's Backup steps write: the database, the secret-store key and .env.
+backups/
 # Local Compose changes, so git pull stays clean on upgrade.
 docker-compose.override.yaml
 docker-compose.override.yml

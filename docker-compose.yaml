@@ -2,19 +2,21 @@
 #
 # This is the Lite stack: proxy + control plane + Postgres. No AI
 # services (no ghost-inference, no ghost-llamacpp, no llama-isolated
-# network). Pro trials default to this topology. License capabilities are
-# unchanged. Workspaces with the Full stack enabled can choose it in the
-# dashboard or with the install download's ?variant=full.
+# network). License capabilities are unchanged. docker-compose.full.yaml
+# beside this file is the Full stack, with the AI services; ./setup.sh asks
+# which one to run and writes the choice to .env as COMPOSE_FILE.
 #
-# Prerequisites:
+# Install (README.md has every step, the settings and the manual alternative):
 #   1. Get your license key from https://gostly.ai/dashboard.
-#   2. Follow the dashboard's registry sign-in instructions (--password-stdin).
-#   3. Keep your private .env alongside this file and fill in
-#      GOSTLY_LICENSE_KEY. Preserve existing database passwords and tenant ID.
-#      A fresh .env starts on the bundled demo upstream (COMPOSE_PROFILES=demo
-#      with BACKEND_URL=http://gostly-demo-upstream:8080); its comments say how
-#      to switch BACKEND_URL to your own service.
-#   4. Run: docker compose up
+#   2. Run ./setup.sh in this directory. It makes your private .env from
+#      .template.env, checks the key, signs in to the Gostly registry with it
+#      (the token reaches docker login on --password-stdin, never the command
+#      line) and starts the stack. Keep .env across upgrades: it holds the
+#      database passwords and GOSTLY_TENANT_ID.
+#   3. Open http://localhost:3000. A fresh .env starts on the bundled demo
+#      upstream (COMPOSE_PROFILES=demo with
+#      BACKEND_URL=http://gostly-demo-upstream:8080); its comments say how to
+#      switch BACKEND_URL to your own service.
 
 services:
 
@@ -38,7 +40,7 @@ services:
   # applies the sole Alembic head and initializes the shared service key, then
   # exits before the serving process starts.
   ghost-migrate:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:426bf865655543689d472d14e574d1c6f7d9a97711adbd8dd11742596e10e170
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:7bbed4862ad153e216abf2e552d5ae0187a51c1cfb0e2d6abbfade7427c8aa98
     container_name: ghost-migrate
     # No privilege gain after start, and no Linux capabilities.
     security_opt:
@@ -220,13 +222,17 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       DATABASE_URL: ${DATABASE_URL:-postgresql://gostly_app:${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
       SERVICE_DATABASE_URL: ${SERVICE_DATABASE_URL:-postgresql://gostly_service:${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+      # As ghost-web: `admin erase`, run in this container, deletes recordings
+      # through the agent and reads its serving files.
+      AGENT_URL:            http://ghost-proxy:8080
+      MOCK_DIR:             /data/mocks
     depends_on:
       ghost-postgres:
         condition: service_healthy
     restart: "no"
 
   ghost-web:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:426bf865655543689d472d14e574d1c6f7d9a97711adbd8dd11742596e10e170
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:7bbed4862ad153e216abf2e552d5ae0187a51c1cfb0e2d6abbfade7427c8aa98
     container_name: ghost-web
     # No privilege gain after start, and no Linux capabilities.
     security_opt:
@@ -243,6 +249,7 @@ services:
       # Keep host port 8000: the dashboard in this image calls http://localhost:8000.
       - "127.0.0.1:8000:8000"
     environment:
+      GOSTLY_AUDIT_RETENTION_DAYS: ${GOSTLY_AUDIT_RETENTION_DAYS:-365}
       GOSTLY_MIGRATION_MODE: skip
       # Production posture by default: the development authentication bypass is
       # ignored and logs are structured. The API starts only once ghost-migrate
@@ -258,16 +265,19 @@ services:
       # Optional stable tenant pin. Installer-generated .env files set this
       # to the platform organization UUID; empty preserves legacy/manual use.
       GOSTLY_TENANT_ID:     ${GOSTLY_TENANT_ID:-}
-      TRAINING_VERSION_ARCHIVE_ENABLED: ${TRAINING_VERSION_ARCHIVE_ENABLED:-false}
-      ACTIVITIES_V2_ENABLED: ${ACTIVITIES_V2_ENABLED:-false}
-      # Time Chamber API mutations: snapshot, fork and reset through this
-      # service's REST routes (POST /v1/time-chamber/...) and the keyed MCP
-      # episode tools. Off by default; while false those calls are refused
-      # before any database or agent access. ghost-proxy's own /ghost/* episode
-      # routes on port 8080 do not need it. Set true in .env only once this
-      # ghost-web runs the upgraded image (pull and recreate it first, still
-      # false), then recreate ghost-web.
-      GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED: ${GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED:-false}
+      # Rollout gates, on since 2026.11.0: each was held off while an older replica
+      # could still run, and a Compose install replaces ghost-web in one step. Set one to
+      # 0 in .env to turn it off (setup.sh turns an old false on); README.md, "Off by default",
+      # says what each does. Time Chamber mutations are snapshot, fork and reset
+      # through this service's REST routes and the keyed MCP episode tools; the
+      # proxy's own /ghost/* episode routes do not need the gate.
+      TRAINING_VERSION_ARCHIVE_ENABLED: ${TRAINING_VERSION_ARCHIVE_ENABLED:-true}
+      ACTIVITIES_V2_ENABLED: ${ACTIVITIES_V2_ENABLED:-true}
+      GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED: ${GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED:-true}
+      GOSTLY_RECEIPT_TRANSITION_WORKER: ${GOSTLY_RECEIPT_TRANSITION_WORKER:-1}
+      # Raw capture retention in days; a new install's .env sets 30, and empty keeps
+      # captures without a maximum age (README.md, "Off by default").
+      GOSTLY_CAPTURE_MAX_AGE_DAYS: ${GOSTLY_CAPTURE_MAX_AGE_DAYS:-}
       # Telemetry opt-out passthrough — set GOSTLY_TELEMETRY=off in .env to
       # disable the api's daily dashboard-funnel shipper, the same lever
       # that disables the agent's shipper (see .env.example).
@@ -276,6 +286,9 @@ services:
       API_BASE_URL:         http://ghost-web:8000
       MOCK_DIR:             /data/mocks
       TRAFFIC_LOG_DIR:      /data/traffic
+      # Inbound webhooks and WebSocket frames: the directory ghost-proxy writes
+      # ({service_id}.jsonl) and the sync loop imports into the dashboard.
+      WEBHOOK_DIR:          /data/webhooks
       ALLOWED_ORIGINS:      ${ALLOWED_ORIGINS:-http://localhost:3000}
       # Match the Full topology's exact local dashboard Origin boundary.
       # MCP remains license-gated; these settings do not grant the feature.
@@ -307,7 +320,7 @@ services:
       start_period: 20s
 
   ghost-proxy:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/proxy@sha256:d614b119ac4380aaaa0142c63071bfc3e0ebc63340cb1dbba45dcf3e777e1aec
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/proxy@sha256:b6a8fa17deedcb6c3d58e5e59b84b4afd3692547cf03999756089321ee140611
     container_name: ghost-proxy
     # No privilege gain after start, and no Linux capabilities.
     security_opt:
@@ -329,6 +342,20 @@ services:
       REDACT_HEADERS:          ${REDACT_HEADERS:-Authorization,Cookie,X-Api-Key}
       API_URL:                 http://ghost-web:8000
       TRAFFIC_LOG_DIR:         /data/traffic
+      # Inbound webhook and WebSocket-frame capture, one JSONL per service. It
+      # must be on the data volume and match ghost-web's WEBHOOK_DIR: unset, the
+      # agent falls back to data/webhooks under /app, which it cannot create.
+      WEBHOOK_DIR:             /data/webhooks
+      # WebSocket frame capture (both WebSocket lanes), off by default. Set
+      # ENABLE_WS_CAPTURE=true in .env to write each routed service's frames to
+      # WEBHOOK_DIR. Frames have no per-frame redaction, so /health then
+      # reports capture.redacted_at_rest=false.
+      ENABLE_WS_CAPTURE:       ${ENABLE_WS_CAPTURE:-false}
+      # Smart-swap shadow comparison, on by default: a request smart swap
+      # answers is compared in the background with the cached AI response for
+      # it, and that generation is requested when none is cached. Set
+      # GOSTLY_CASCADE_SHADOW=0 in .env to turn both off.
+      GOSTLY_CASCADE_SHADOW:   ${GOSTLY_CASCADE_SHADOW:-1}
       # Telemetry opt-out passthrough — set GOSTLY_TELEMETRY=off in .env to
       # disable the shipper entirely (see .env.example).
       GOSTLY_TELEMETRY:        ${GOSTLY_TELEMETRY:-}
@@ -358,9 +385,9 @@ services:
       start_period: 20s
 
   # Bundled demo upstream, so a first install can record and replay without a
-  # service of its own. It starts only when the demo profile is active; the
-  # downloaded .env does that with COMPOSE_PROFILES=demo, next to the
-  # BACKEND_URL that points at it, so the two always change together. No other
+  # service of its own. It starts only when the demo profile is active; a
+  # fresh .env (from .template.env) does that with COMPOSE_PROFILES=demo, next
+  # to the BACKEND_URL that points at it, so the two always change together. No other
   # service waits on it and it publishes no port. It answers only under the
   # PREFIX path (404 elsewhere), so every demo request, capture and mock path
   # starts with /gostly-demo/ and never matches your own service's paths; the

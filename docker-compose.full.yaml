@@ -2,20 +2,200 @@
 #
 # This file ships the Full stack: the proxy + control plane + Postgres
 # PLUS the inference router and the llama.cpp sidecar that powers generated
-# mocks. The Lite stack omits the AI services; choose it in the dashboard or
-# with the install download's ?variant=lite.
+# mocks. docker-compose.yaml beside this file is the Lite stack, without the
+# AI services; ./setup.sh asks which one to run and writes the choice to .env
+# as COMPOSE_FILE.
 #
-# Prerequisites:
-#   1. Sign up at https://gostly.ai and grab your license key + registry token
-#   2. Authenticate with the Gostly registry:
-#        docker login -u AWS -p <your-registry-token> 242201285974.dkr.ecr.us-east-1.amazonaws.com
-#   3. Copy the .env template you also downloaded and fill in GOSTLY_LICENSE_KEY.
-#      The full key is shown only once at creation — if lost, create a new one
-#      at https://gostly.ai/dashboard. A fresh .env starts on the bundled demo
+# Install (README.md has every step, the settings and the manual alternative):
+#   1. Get your license key from https://gostly.ai/dashboard.
+#   2. Run ./setup.sh in this directory. It makes your private .env from
+#      .template.env, checks the key, signs in to the Gostly registry with it
+#      (the token reaches docker login on --password-stdin, never the command
+#      line) and starts the stack. Keep .env across upgrades: it holds the
+#      database passwords and GOSTLY_TENANT_ID.
+#   3. Open http://localhost:3000. A fresh .env starts on the bundled demo
 #      upstream (COMPOSE_PROFILES=demo with
 #      BACKEND_URL=http://gostly-demo-upstream:8080); its comments say how to
 #      switch BACKEND_URL to your own service.
-#   4. Run: docker compose up
+
+# ghost-web's environment. ghost-migrate below takes all of it too, plus its
+# migration mode and the schema-owner credentials, so its key bootstrap runs
+# the API's own production start check with the API's settings, the boot
+# ingest of the service definition runs under the API's tenant and license,
+# and its two admin commands (erase-replay, and audit-prune under the
+# retention floor) run with the settings the API runs with.
+# Add a setting here, not to one service, unless only that service may hold it.
+x-ghost-web-env: &ghost-web-env
+  GOSTLY_AUDIT_RETENTION_DAYS: ${GOSTLY_AUDIT_RETENTION_DAYS:-365}
+  # Production posture by default: the development authentication bypass is
+  # ignored and logs are structured. The API starts only once ghost-migrate
+  # has created the shared service credential in the data volume.
+  ENVIRONMENT:          ${ENVIRONMENT:-production}
+  LOG_FORMAT:           ${LOG_FORMAT:-json}
+  # Optional operator pin. ghost-migrate reads the same value from this list,
+  # so the two agree about the key file. When set it is the service key: it is mirrored to /data/service.key (which ghost-proxy
+  # reads, so the proxy is not wired), it is visible in this container's
+  # metadata, its format is not validated, and key rotation is refused.
+  GHOST_API_KEY:        ${GHOST_API_KEY:-}
+  GOSTLY_LICENSE_KEY:   ${GOSTLY_LICENSE_KEY:-}
+  # Optional stable tenant pin. Installer-generated .env files set this
+  # to the platform organization UUID; empty preserves legacy/manual use.
+  GOSTLY_TENANT_ID:     ${GOSTLY_TENANT_ID:-}
+  # Rollout gates, on since 2026.11.0: each was held off while an older replica
+  # could still run, and a Compose install replaces ghost-web in one step. Set one to
+  # 0 in .env to turn it off (setup.sh turns an old false on); README.md, "Off by default",
+  # says what each does. Time Chamber mutations are snapshot, fork and reset
+  # through this service's REST routes and the keyed MCP episode tools; the
+  # proxy's own /ghost/* episode routes do not need the gate.
+  TRAINING_VERSION_ARCHIVE_ENABLED: ${TRAINING_VERSION_ARCHIVE_ENABLED:-true}
+  ACTIVITIES_V2_ENABLED: ${ACTIVITIES_V2_ENABLED:-true}
+  GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED: ${GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED:-true}
+  GOSTLY_RECEIPT_TRANSITION_WORKER: ${GOSTLY_RECEIPT_TRANSITION_WORKER:-1}
+  # Telemetry opt-out passthrough — set GOSTLY_TELEMETRY=off in .env to
+  # disable the api's daily dashboard-funnel shipper, the same lever
+  # that disables the agent's shipper (see .env.example).
+  GOSTLY_TELEMETRY:     ${GOSTLY_TELEMETRY:-}
+  AGENT_URL:            http://ghost-proxy:8080
+  # /eval/run proxy timeout (seconds) — scales with output budget × holdout
+  # size (see .env.example).
+  GOSTLY_EVAL_TIMEOUT_S: ${GOSTLY_EVAL_TIMEOUT_S:-300}
+  GOSTLY_EVAL_ATTEMPT_MAX_HORIZON_S: ${GOSTLY_EVAL_ATTEMPT_MAX_HORIZON_S:-3600}
+  GOSTLY_EVAL_LEASE_GRACE_S: ${GOSTLY_EVAL_LEASE_GRACE_S:-30}
+  INFERENCE_URL:        http://ghost-inference:5000
+  API_BASE_URL:         http://ghost-web:8000
+  MOCK_DIR:             /data/mocks
+  TRAFFIC_LOG_DIR:      /data/traffic
+  # Inbound webhooks and WebSocket frames: the directory ghost-proxy writes
+  # ({service_id}.jsonl) and the sync loop imports into the dashboard.
+  WEBHOOK_DIR:          /data/webhooks
+  # Wide events (one per recorded request), on by default. Set
+  # ENABLE_OBSERVABILITY=false in .env to turn them off in both services: the
+  # proxy writes WIDE_EVENTS_DIR and this service imports it, so both name
+  # the same directory on the data volume.
+  ENABLE_OBSERVABILITY: ${ENABLE_OBSERVABILITY:-true}
+  WIDE_EVENTS_DIR:      /data/wide_events
+  ALLOWED_ORIGINS:      ${ALLOWED_ORIGINS:-http://localhost:3000}
+  # The API's MCP Origin allowlist defaults to empty (fail closed). This
+  # local topology explicitly opts in only the dashboard origin published
+  # above. Override with the exact browser origin if you change that URL;
+  # wildcards and regexes are intentionally rejected.
+  MCP_ALLOWED_ORIGINS:  ${MCP_ALLOWED_ORIGINS:-http://localhost:3000}
+  # Raw MCP POST ceiling, enforced before UTF-8 or JSON decoding.
+  MCP_MAX_REQUEST_BODY_BYTES: ${MCP_MAX_REQUEST_BODY_BYTES:-1048576}
+  OPENAI_API_KEY:       ${OPENAI_API_KEY:-}
+  # Exact private origins (scheme://host:port, comma-separated) that webhook
+  # and canary replay may reach; empty admits none. Internal OpenAPI spec
+  # hosts are to use this same list; URL import does not read it yet.
+  GOSTLY_OUTBOUND_ALLOWED_PRIVATE_ORIGINS: ${GOSTLY_OUTBOUND_ALLOWED_PRIVATE_ORIGINS:-}
+  # Runtime connections use only the non-owner roles created by the
+  # short-lived ghost-migrate job. Owner/bootstrap values are deliberately
+  # absent from this long-lived container's environment and metadata.
+  DATABASE_URL:         ${DATABASE_URL:-postgresql://gostly_app:${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+  SERVICE_DATABASE_URL: ${SERVICE_DATABASE_URL:-postgresql://gostly_service:${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
+  GOSTLY_AUTH_MODE:                ${GOSTLY_AUTH_MODE:-password}
+  GOSTLY_ADMIN_EMAIL:              ${GOSTLY_ADMIN_EMAIL:-}
+  GOSTLY_ADMIN_PASSWORD:           ${GOSTLY_ADMIN_PASSWORD:-}
+  GOSTLY_ADMIN_FULL_NAME:          ${GOSTLY_ADMIN_FULL_NAME:-}
+  GOSTLY_AUTH_SESSION_TTL_HOURS:   ${GOSTLY_AUTH_SESSION_TTL_HOURS:-12}
+  GOSTLY_AUTH_SESSION_IDLE_MINUTES: ${GOSTLY_AUTH_SESSION_IDLE_MINUTES:-0}
+  GOSTLY_AUTH_SIGN_IN_PER_MINUTE:  ${GOSTLY_AUTH_SIGN_IN_PER_MINUTE:-10}
+  GOSTLY_AUTH_SIGN_IN_PER_HOUR:    ${GOSTLY_AUTH_SIGN_IN_PER_HOUR:-30}
+  # Socket peers whose X-Forwarded-For names the client (sign-in throttling, audit,
+  # session addresses). The default trusts loopback and this network's Docker gateway:
+  # a reverse proxy on the Docker host, or a browser on it. A proxy elsewhere goes here
+  # too, as ghost-web sees it (another container: its address on this network).
+  TRUSTED_PROXIES:                 ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,gateway}
+  GOSTLY_AUTH_COOKIE_SECURE:       ${GOSTLY_AUTH_COOKIE_SECURE:-true}
+  GOSTLY_AUTH_COOKIE_DOMAIN:       ${GOSTLY_AUTH_COOKIE_DOMAIN:-}
+  GOSTLY_AUTH_ALLOWED_DOMAINS:     ${GOSTLY_AUTH_ALLOWED_DOMAINS:-}
+  GOSTLY_AUTH_AUTO_PROVISION:      ${GOSTLY_AUTH_AUTO_PROVISION:-true}
+  GOSTLY_AUTH_DEFAULT_ROLE:        ${GOSTLY_AUTH_DEFAULT_ROLE:-viewer}
+  GOSTLY_AUTH_GROUP_TO_ROLE_MAP:   ${GOSTLY_AUTH_GROUP_TO_ROLE_MAP:-}
+  GOSTLY_SAML_IDP_METADATA_URL:    ${GOSTLY_SAML_IDP_METADATA_URL:-}
+  GOSTLY_SAML_IDP_METADATA_XML:    ${GOSTLY_SAML_IDP_METADATA_XML:-}
+  GOSTLY_SAML_IDP_ENTITY_ID:       ${GOSTLY_SAML_IDP_ENTITY_ID:-}
+  GOSTLY_SAML_SP_ENTITY_ID:        ${GOSTLY_SAML_SP_ENTITY_ID:-}
+  GOSTLY_SAML_SP_ACS_URL:          ${GOSTLY_SAML_SP_ACS_URL:-}
+  GOSTLY_SAML_SP_SLO_URL:          ${GOSTLY_SAML_SP_SLO_URL:-}
+  GOSTLY_SAML_GROUP_ATTRIBUTE:     ${GOSTLY_SAML_GROUP_ATTRIBUTE:-memberOf}
+  GOSTLY_SAML_EMAIL_ATTRIBUTE:     ${GOSTLY_SAML_EMAIL_ATTRIBUTE:-email}
+  GOSTLY_SAML_NAME_ATTRIBUTE:      ${GOSTLY_SAML_NAME_ATTRIBUTE:-displayName}
+  # Signed AuthnRequests: the SP certificate and key, each inline or (its
+  # _FILE variant) as the path of a file mounted into the container.
+  GOSTLY_SAML_SP_X509_CERT:        ${GOSTLY_SAML_SP_X509_CERT:-}
+  GOSTLY_SAML_SP_X509_CERT_FILE:   ${GOSTLY_SAML_SP_X509_CERT_FILE:-}
+  GOSTLY_SAML_SP_PRIVATE_KEY:      ${GOSTLY_SAML_SP_PRIVATE_KEY:-}
+  GOSTLY_SAML_SP_PRIVATE_KEY_FILE: ${GOSTLY_SAML_SP_PRIVATE_KEY_FILE:-}
+  GOSTLY_OIDC_ISSUER:              ${GOSTLY_OIDC_ISSUER:-}
+  GOSTLY_OIDC_CLIENT_ID:           ${GOSTLY_OIDC_CLIENT_ID:-}
+  # One client credential: the secret inline or from a mounted file, or a
+  # private key file for private_key_jwt.
+  GOSTLY_OIDC_CLIENT_SECRET:       ${GOSTLY_OIDC_CLIENT_SECRET:-}
+  GOSTLY_OIDC_CLIENT_SECRET_FILE:  ${GOSTLY_OIDC_CLIENT_SECRET_FILE:-}
+  GOSTLY_OIDC_CLIENT_KEY_FILE:     ${GOSTLY_OIDC_CLIENT_KEY_FILE:-}
+  GOSTLY_OIDC_REDIRECT_URI:        ${GOSTLY_OIDC_REDIRECT_URI:-}
+  GOSTLY_OIDC_SCOPES:              ${GOSTLY_OIDC_SCOPES:-openid email profile groups}
+  GOSTLY_OIDC_EMAIL_CLAIM:         ${GOSTLY_OIDC_EMAIL_CLAIM:-email}
+  GOSTLY_OIDC_NAME_CLAIM:          ${GOSTLY_OIDC_NAME_CLAIM:-name}
+  GOSTLY_OIDC_GROUP_CLAIM:         ${GOSTLY_OIDC_GROUP_CLAIM:-groups}
+  GOSTLY_OIDC_DISPLAY_NAME:        ${GOSTLY_OIDC_DISPLAY_NAME:-}
+  # The install key that seals the secrets the API stores (provider keys, model
+  # connection credentials), on a volume of its own: the data volume, its backups
+  # and a database dump never carry it. The API creates it on the first saved
+  # secret; back the secret-store volume up apart from the database.
+  GOSTLY_SECRET_STORE_KEY_FILE: /var/lib/gostly/secret-store/secret-store.key
+  # >>> generated by api/tests/_configuration_catalogue.py sync: the operator settings this service reads
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+  DRIFT_MATVIEW_REFRESH_ENABLED: ${DRIFT_MATVIEW_REFRESH_ENABLED:-1}
+  DRIFT_MATVIEW_REFRESH_INTERVAL_SECS: ${DRIFT_MATVIEW_REFRESH_INTERVAL_SECS:-300}
+  DRIFT_MATVIEW_REFRESH_JITTER_SECS: ${DRIFT_MATVIEW_REFRESH_JITTER_SECS:-30}
+  DRIFT_MATVIEW_REFRESH_STATEMENT_TIMEOUT_SECS: ${DRIFT_MATVIEW_REFRESH_STATEMENT_TIMEOUT_SECS:-120}
+  ENABLE_AI_MOCK_REPAIR: ${ENABLE_AI_MOCK_REPAIR:-false}
+  ENABLE_UPSTREAM_ALIGNMENT_SYNC: ${ENABLE_UPSTREAM_ALIGNMENT_SYNC:-false}
+  GOSTLY_AGENT_SESSION_MAX_AGE_DAYS: ${GOSTLY_AGENT_SESSION_MAX_AGE_DAYS:-365}
+  GOSTLY_CAPTURE_MAX_AGE_DAYS: ${GOSTLY_CAPTURE_MAX_AGE_DAYS:-}
+  GOSTLY_DRIFT_CHECK_MAX_EVENTS_PER_CHECK: ${GOSTLY_DRIFT_CHECK_MAX_EVENTS_PER_CHECK:-500}
+  GOSTLY_DRIFT_CHECK_MAX_PROJECTED_BYTES_PER_CHECK: ${GOSTLY_DRIFT_CHECK_MAX_PROJECTED_BYTES_PER_CHECK:-12582912}
+  GOSTLY_DRIFT_CHECK_MAX_PROJECTED_BYTES_PER_SESSION: ${GOSTLY_DRIFT_CHECK_MAX_PROJECTED_BYTES_PER_SESSION:-8388608}
+  GOSTLY_DRIFT_CHECK_MAX_RECURSIVE_NODES_PER_CHECK: ${GOSTLY_DRIFT_CHECK_MAX_RECURSIVE_NODES_PER_CHECK:-24000}
+  GOSTLY_DRIFT_CHECK_MAX_RECURSIVE_NODES_PER_SESSION: ${GOSTLY_DRIFT_CHECK_MAX_RECURSIVE_NODES_PER_SESSION:-16000}
+  GOSTLY_DRIFT_CHECK_MAX_ROUTES_PER_CHECK: ${GOSTLY_DRIFT_CHECK_MAX_ROUTES_PER_CHECK:-1500}
+  GOSTLY_DRIFT_CHECK_MAX_ROUTES_PER_SESSION: ${GOSTLY_DRIFT_CHECK_MAX_ROUTES_PER_SESSION:-1000}
+  GOSTLY_DRIFT_CHECK_MAX_ROWS_PER_CHECK: ${GOSTLY_DRIFT_CHECK_MAX_ROWS_PER_CHECK:-8000}
+  GOSTLY_DRIFT_CHECK_MAX_ROWS_PER_SESSION: ${GOSTLY_DRIFT_CHECK_MAX_ROWS_PER_SESSION:-5000}
+  GOSTLY_MODEL_ALLOWED_PRIVATE_ORIGINS: ${GOSTLY_MODEL_ALLOWED_PRIVATE_ORIGINS:-}
+  GOSTLY_NOTIFY_CONFIG: ${GOSTLY_NOTIFY_CONFIG:-}
+  GOSTLY_NOTIFY_SECRET: ${GOSTLY_NOTIFY_SECRET:-}
+  GOSTLY_NOTIFY_SECRET_FILE: ${GOSTLY_NOTIFY_SECRET_FILE:-}
+  GOSTLY_NOTIFY_URL: ${GOSTLY_NOTIFY_URL:-}
+  GOSTLY_NOTIFY_URL_FILE: ${GOSTLY_NOTIFY_URL_FILE:-}
+  GOSTLY_OUTBOUND_ALLOWED_ORIGINS: ${GOSTLY_OUTBOUND_ALLOWED_ORIGINS:-}
+  GOSTLY_PROXY_PUBLIC_URL: ${GOSTLY_PROXY_PUBLIC_URL:-}
+  GOSTLY_PUBLIC_URL: ${GOSTLY_PUBLIC_URL:-}
+  GOSTLY_STUDIO_RESULT_TTL_DAYS: ${GOSTLY_STUDIO_RESULT_TTL_DAYS:-7}
+  GOSTLY_TELEMETRY_TIER: ${GOSTLY_TELEMETRY_TIER:-}
+  GOSTLY_TRANSITION_CALIBRATION_MAX_LEGACY_CALLS: ${GOSTLY_TRANSITION_CALIBRATION_MAX_LEGACY_CALLS:-100}
+  GOSTLY_TRANSITION_MAX_CONCURRENT: ${GOSTLY_TRANSITION_MAX_CONCURRENT:-4}
+  GOSTLY_TRANSITION_MAX_CONCURRENT_PER_TENANT: ${GOSTLY_TRANSITION_MAX_CONCURRENT_PER_TENANT:-2}
+  GOSTLY_TRANSITION_MAX_SAMPLED_ENDPOINTS: ${GOSTLY_TRANSITION_MAX_SAMPLED_ENDPOINTS:-1000}
+  GOSTLY_WORKER_HEARTBEAT_SECS: ${GOSTLY_WORKER_HEARTBEAT_SECS:-30}
+  GOSTLY_WORKER_LEASE_SECS: ${GOSTLY_WORKER_LEASE_SECS:-120}
+  GOSTLY_WORKER_MAX_CONCURRENT: ${GOSTLY_WORKER_MAX_CONCURRENT:-1}
+  GOSTLY_WORKER_MAX_CONCURRENT_PER_TENANT: ${GOSTLY_WORKER_MAX_CONCURRENT_PER_TENANT:-1}
+  GOSTLY_WORKER_POLL_INTERVAL_SECS: ${GOSTLY_WORKER_POLL_INTERVAL_SECS:-2.0}
+  GOSTLY_WORKER_RECONCILIATION_BACKOFF_SECS: ${GOSTLY_WORKER_RECONCILIATION_BACKOFF_SECS:-30}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  LICENSE_STALE_TTL: ${LICENSE_STALE_TTL:-14400}
+  LLM_AZURE_API_KEY: ${LLM_AZURE_API_KEY:-}
+  MAX_BODY_BYTES: ${MAX_BODY_BYTES:-1048576}
+  NO_PROXY: ${NO_PROXY:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT:
+  OTEL_EXPORTER_OTLP_HEADERS:
+  SERVICE_KEY_ROTATE_GRACE_SECS: ${SERVICE_KEY_ROTATE_GRACE_SECS:-300}
+  SSL_CERT_FILE:
+  # <<< generated
 
 services:
 
@@ -36,10 +216,14 @@ services:
       retries: 5
 
   # One-shot schema authority. It uses the exact same image as ghost-web,
-  # applies the sole Alembic head and initializes the shared service key, then
-  # exits before the serving process starts.
+  # applies the sole Alembic head, applies the mounted service definition and
+  # initializes the shared service key, then exits before the serving process
+  # starts. Operator commands run in ghost-web, on the API's role:
+  #   docker compose exec -w /app/api ghost-web python -m admin <command>
+  # A one-off copy of this job runs only the two that need the schema owner:
+  #   docker compose run --rm ghost-migrate admin erase-replay | audit-prune
   ghost-migrate:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:426bf865655543689d472d14e574d1c6f7d9a97711adbd8dd11742596e10e170
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:7bbed4862ad153e216abf2e552d5ae0187a51c1cfb0e2d6abbfade7427c8aa98
     container_name: ghost-migrate
     # No privilege gain after start, and no Linux capabilities.
     security_opt:
@@ -50,9 +234,25 @@ services:
     # signals to the whole child process group, including the migration worker.
     # Only a successful migration may initialize the shared credential before
     # either API worker starts. The image remains identical to ghost-web.
-    entrypoint: ["/usr/bin/tini", "-g", "--", "/bin/sh", "-ec"]
-    command:
+    # The script is an entrypoint argument, not the command, so the arguments of
+    # `docker compose run --rm ghost-migrate admin <command>` reach it: the image
+    # runs only `admin audit-prune` and `admin erase-replay` here (the commands
+    # that need the schema owner) and refuses every other admin command, which
+    # runs in ghost-web (`docker compose exec -w /app/api ghost-web python -m
+    # admin <command>`); any other argument is refused before anything runs.
+    # $$ is Compose's escape for $.
+    entrypoint:
+      - /usr/bin/tini
+      - -g
+      - --
+      - /bin/sh
+      - -ec
       - |
+        if [ "$${1:-}" = admin ]; then exec /app/ghost-web-entrypoint.sh "$$@"; fi
+        if [ "$$#" -ne 0 ]; then
+          echo "ghost-migrate refused: its only arguments are admin <command> (docker compose run --rm ghost-migrate admin --help)" >&2
+          exit 2
+        fi
         /app/ghost-web-entrypoint.sh
         . /app/ghost-web-scrub-migration-env.sh
         cd /app/api
@@ -203,31 +403,40 @@ services:
             raise SystemExit(2) from None
         print(json.dumps({"event": "installer_service_key_bootstrap", "status": "ready"}), flush=True)
         PYKEY
+      - ghost-migrate
     volumes:
       - gostly-data:/data
+      - secret-store:/var/lib/gostly/secret-store
+      # Operator files a setting names by path, read-only: put them in files/
+      # beside this file and set SSL_CERT_FILE or a sign-in *_FILE variable to
+      # /etc/gostly/files/<name>. Each must be readable by UID 10001. Compose
+      # creates files/ empty when it is missing (owned by root on native Linux).
+      - ./files:/etc/gostly/files:ro
+      # Your service definition: .gostly/services.yaml (gostly.services.v1) in
+      # this directory, read-only, applied after the migrations (boot ingest;
+      # see /health service_definition). GOSTLY_DEFINITION_DIR in .env points
+      # at another directory, such as your service repository's .gostly/.
+      # When the directory does not exist Compose creates it empty (owned by
+      # root on native Linux) and the ingest reports absent.
+      - type: bind
+        source: ${GOSTLY_DEFINITION_DIR:-./.gostly}
+        target: /gostly
+        read_only: true
     environment:
+      <<: *ghost-web-env
       GOSTLY_MIGRATION_MODE: migrate
-      # Matches ghost-web so the bootstrap can run this image's own production
-      # start check against the key it just persisted. Migrations ignore it.
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      # Optional operator pin, from .env. ghost-web below receives the same
-      # value: the two must agree or they disagree about the key file. Blank
-      # means unpinned, and the job creates a managed key.
-      GHOST_API_KEY: ${GHOST_API_KEY:-}
       GOSTLY_REQUIRE_DISTINCT_DB_CREDENTIALS: "1"
       MIGRATIONS_DATABASE_URL: ${MIGRATIONS_DATABASE_URL:-postgresql://${POSTGRES_USER:-ghost}:${POSTGRES_PASSWORD}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
       GOSTLY_APP_DB_PASSWORD: ${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set and differ from POSTGRES_PASSWORD}
       GOSTLY_SERVICE_DB_PASSWORD: ${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set and differ from the other database passwords}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://gostly_app:${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
-      SERVICE_DATABASE_URL: ${SERVICE_DATABASE_URL:-postgresql://gostly_service:${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
     depends_on:
       ghost-postgres:
         condition: service_healthy
     restart: "no"
 
   ghost-web:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:426bf865655543689d472d14e574d1c6f7d9a97711adbd8dd11742596e10e170
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/web@sha256:7bbed4862ad153e216abf2e552d5ae0187a51c1cfb0e2d6abbfade7427c8aa98
     container_name: ghost-web
     # No privilege gain after start, and no Linux capabilities.
     security_opt:
@@ -244,94 +453,25 @@ services:
       # Keep host port 8000: the dashboard in this image calls http://localhost:8000.
       - "127.0.0.1:8000:8000"
     environment:
+      <<: *ghost-web-env
       GOSTLY_CONNECTED_AI_AUTHORITY_DIR: /var/lib/gostly/connected-ai
       GOSTLY_MIGRATION_MODE: skip
-      # Production posture by default: the development authentication bypass is
-      # ignored and logs are structured. The API starts only once ghost-migrate
-      # has created the shared service credential in the data volume.
-      ENVIRONMENT:          ${ENVIRONMENT:-production}
-      LOG_FORMAT:           ${LOG_FORMAT:-json}
-      # Optional operator pin, identical to ghost-migrate's. When set it is the
-      # service key: it is mirrored to /data/service.key (which ghost-proxy
-      # reads, so the proxy is not wired), it is visible in this container's
-      # metadata, its format is not validated, and key rotation is refused.
-      GHOST_API_KEY:        ${GHOST_API_KEY:-}
-      GOSTLY_LICENSE_KEY:   ${GOSTLY_LICENSE_KEY:-}
-      # Optional stable tenant pin. Installer-generated .env files set this
-      # to the platform organization UUID; empty preserves legacy/manual use.
-      GOSTLY_TENANT_ID:     ${GOSTLY_TENANT_ID:-}
-      TRAINING_VERSION_ARCHIVE_ENABLED: ${TRAINING_VERSION_ARCHIVE_ENABLED:-false}
-      ACTIVITIES_V2_ENABLED: ${ACTIVITIES_V2_ENABLED:-false}
-      # Time Chamber API mutations: snapshot, fork and reset through this
-      # service's REST routes (POST /v1/time-chamber/...) and the keyed MCP
-      # episode tools. Off by default; while false those calls are refused
-      # before any database or agent access. ghost-proxy's own /ghost/* episode
-      # routes on port 8080 do not need it. Set true in .env only once this
-      # ghost-web runs the upgraded image (pull and recreate it first, still
-      # false), then recreate ghost-web.
-      GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED: ${GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED:-false}
-      # Telemetry opt-out passthrough — set GOSTLY_TELEMETRY=off in .env to
-      # disable the api's daily dashboard-funnel shipper, the same lever
-      # that disables the agent's shipper (see .env.example).
-      GOSTLY_TELEMETRY:     ${GOSTLY_TELEMETRY:-}
-      AGENT_URL:            http://ghost-proxy:8080
-      # /eval/run proxy timeout (seconds) — scales with output budget × holdout
-      # size (see .env.example).
-      GOSTLY_EVAL_TIMEOUT_S: ${GOSTLY_EVAL_TIMEOUT_S:-300}
-      GOSTLY_EVAL_ATTEMPT_MAX_HORIZON_S: ${GOSTLY_EVAL_ATTEMPT_MAX_HORIZON_S:-3600}
-      GOSTLY_EVAL_LEASE_GRACE_S: ${GOSTLY_EVAL_LEASE_GRACE_S:-30}
-      INFERENCE_URL:        http://ghost-inference:5000
-      API_BASE_URL:         http://ghost-web:8000
-      MOCK_DIR:             /data/mocks
-      TRAFFIC_LOG_DIR:      /data/traffic
-      ALLOWED_ORIGINS:      ${ALLOWED_ORIGINS:-http://localhost:3000}
-      # The API's MCP Origin allowlist defaults to empty (fail closed). This
-      # local topology explicitly opts in only the dashboard origin published
-      # above. Override with the exact browser origin if you change that URL;
-      # wildcards and regexes are intentionally rejected.
-      MCP_ALLOWED_ORIGINS:  ${MCP_ALLOWED_ORIGINS:-http://localhost:3000}
-      # Raw MCP POST ceiling, enforced before UTF-8 or JSON decoding.
-      MCP_MAX_REQUEST_BODY_BYTES: ${MCP_MAX_REQUEST_BODY_BYTES:-1048576}
-      OPENAI_API_KEY:       ${OPENAI_API_KEY:-}
-      # Runtime connections use only the non-owner roles created by the
-      # short-lived ghost-migrate job. Owner/bootstrap values are deliberately
-      # absent from this long-lived container's environment and metadata.
-      DATABASE_URL:         ${DATABASE_URL:-postgresql://gostly_app:${GOSTLY_APP_DB_PASSWORD:?GOSTLY_APP_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
-      SERVICE_DATABASE_URL: ${SERVICE_DATABASE_URL:-postgresql://gostly_service:${GOSTLY_SERVICE_DB_PASSWORD:?GOSTLY_SERVICE_DB_PASSWORD must be set}@ghost-postgres:5432/${POSTGRES_DB:-ghost}}
-      GOSTLY_AUTH_MODE:                ${GOSTLY_AUTH_MODE:-password}
-      GOSTLY_ADMIN_EMAIL:              ${GOSTLY_ADMIN_EMAIL:-}
-      GOSTLY_ADMIN_PASSWORD:           ${GOSTLY_ADMIN_PASSWORD:-}
-      GOSTLY_ADMIN_FULL_NAME:          ${GOSTLY_ADMIN_FULL_NAME:-}
-      GOSTLY_AUTH_SESSION_TTL_HOURS:   ${GOSTLY_AUTH_SESSION_TTL_HOURS:-12}
-      GOSTLY_AUTH_COOKIE_SECURE:       ${GOSTLY_AUTH_COOKIE_SECURE:-true}
-      GOSTLY_AUTH_COOKIE_DOMAIN:       ${GOSTLY_AUTH_COOKIE_DOMAIN:-}
-      GOSTLY_AUTH_ALLOWED_DOMAINS:     ${GOSTLY_AUTH_ALLOWED_DOMAINS:-}
-      GOSTLY_AUTH_AUTO_PROVISION:      ${GOSTLY_AUTH_AUTO_PROVISION:-true}
-      GOSTLY_AUTH_DEFAULT_ROLE:        ${GOSTLY_AUTH_DEFAULT_ROLE:-viewer}
-      GOSTLY_AUTH_GROUP_TO_ROLE_MAP:   ${GOSTLY_AUTH_GROUP_TO_ROLE_MAP:-}
-      GOSTLY_SAML_IDP_METADATA_URL:    ${GOSTLY_SAML_IDP_METADATA_URL:-}
-      GOSTLY_SAML_IDP_METADATA_XML:    ${GOSTLY_SAML_IDP_METADATA_XML:-}
-      GOSTLY_SAML_SP_ENTITY_ID:        ${GOSTLY_SAML_SP_ENTITY_ID:-}
-      GOSTLY_SAML_SP_ACS_URL:          ${GOSTLY_SAML_SP_ACS_URL:-}
-      GOSTLY_SAML_GROUP_ATTRIBUTE:     ${GOSTLY_SAML_GROUP_ATTRIBUTE:-memberOf}
-      GOSTLY_SAML_EMAIL_ATTRIBUTE:     ${GOSTLY_SAML_EMAIL_ATTRIBUTE:-email}
-      GOSTLY_SAML_NAME_ATTRIBUTE:      ${GOSTLY_SAML_NAME_ATTRIBUTE:-displayName}
-      GOSTLY_OIDC_ISSUER:              ${GOSTLY_OIDC_ISSUER:-}
-      GOSTLY_OIDC_CLIENT_ID:           ${GOSTLY_OIDC_CLIENT_ID:-}
-      GOSTLY_OIDC_CLIENT_SECRET:       ${GOSTLY_OIDC_CLIENT_SECRET:-}
-      GOSTLY_OIDC_REDIRECT_URI:        ${GOSTLY_OIDC_REDIRECT_URI:-}
-      GOSTLY_OIDC_SCOPES:              ${GOSTLY_OIDC_SCOPES:-openid email profile groups}
-      GOSTLY_OIDC_GROUP_CLAIM:         ${GOSTLY_OIDC_GROUP_CLAIM:-groups}
-      GOSTLY_OIDC_DISPLAY_NAME:        ${GOSTLY_OIDC_DISPLAY_NAME:-}
     volumes:
       - connected-ai-authority:/var/lib/gostly/connected-ai
+      - secret-store:/var/lib/gostly/secret-store
+      # Operator files a setting names by path, read-only: put them in files/
+      # beside this file and set SSL_CERT_FILE or a sign-in *_FILE variable to
+      # /etc/gostly/files/<name>. Each must be readable by UID 10001. Compose
+      # creates files/ empty when it is missing (owned by root on native Linux).
+      - ./files:/etc/gostly/files:ro
       - gostly-data:/data
     depends_on:
       ghost-migrate:
         condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      # No proxy handler: HTTP_PROXY from .env must never carry the probe of the API's own port.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://localhost:8000/health').read()"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -342,8 +482,17 @@ services:
   # host-side model download. Attaches to `llama-isolated` only, which is
   # internal:true → no outbound route to the internet.
   ghost-llamacpp:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/llamacpp@sha256:2869da914368a5297e1a735daea424d6877da76bd6fc791f5acbe3498dee1e9b
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/llamacpp@sha256:de9273feacad26bbcc66ea34a14ca2e6c88e0ffb622619ade41a7c0c9829bf8f
     container_name: ghost-llamacpp
+    environment:
+      # >>> generated by api/tests/_configuration_catalogue.py sync: the operator settings this service reads
+      ADAPTER_HOTSET_MAX_BYTES: ${ADAPTER_HOTSET_MAX_BYTES:-68719476736}
+      ADAPTER_HOTSET_MAX_COUNT: ${ADAPTER_HOTSET_MAX_COUNT:-64}
+      ENABLE_ADAPTER_HOTSET_MANIFEST: ${ENABLE_ADAPTER_HOTSET_MANIFEST:-false}
+      LLAMACPP_DRAFT_MODEL: ${LLAMACPP_DRAFT_MODEL:-}
+      LLAMACPP_PARALLEL: ${LLAMACPP_PARALLEL:-}
+      LLAMACPP_THREADS: ${LLAMACPP_THREADS:-}
+      # <<< generated
     # No privilege gain after start. The image runs as root (it has no USER),
     # so it keeps only DAC_READ_SEARCH to read the UID 10001 0700 authority
     # volume and adapters.
@@ -398,7 +547,7 @@ services:
           memory: ${LLAMACPP_MEM_LIMIT:-6G}
 
   ghost-inference:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/inference@sha256:be3f4d770d6ec8b9044a98c3e68cd9af7a11dd9e4c14c9040b993a7c87e6c533
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/inference@sha256:b75220235d05ed251e859913d13a709aae1e02fa8b34f59e9113cee7503ff7aa
     container_name: ghost-inference
     # No privilege gain after start, and no Linux capabilities.
     security_opt:
@@ -411,8 +560,6 @@ services:
     environment:
       GOSTLY_CONNECTED_AI_AUTHORITY_DIR: /var/lib/gostly/connected-ai
       MOCK_DIR:             /data/mocks
-      FAISS_INDEX_PATH:     /data/faiss.index
-      FAISS_MAP_PATH:       /data/faiss_id_map.json
       ENABLE_RAG:           ${ENABLE_RAG:-true}
       API_BASE_URL:         http://ghost-web:8000
       LLAMACPP_ENDPOINT:    http://ghost-llamacpp:8080
@@ -432,6 +579,15 @@ services:
       OMP_NUM_THREADS:      ${INFERENCE_NUM_THREADS:-4}
       MKL_NUM_THREADS:      ${INFERENCE_NUM_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${INFERENCE_NUM_THREADS:-4}
+      # >>> generated by api/tests/_configuration_catalogue.py sync: the operator settings this service reads
+      ADAPTER_HOTSET_MAX_BYTES: ${ADAPTER_HOTSET_MAX_BYTES:-68719476736}
+      ADAPTER_HOTSET_MAX_COUNT: ${ADAPTER_HOTSET_MAX_COUNT:-64}
+      ADAPTER_HOTSET_PINS_FILE: ${ADAPTER_HOTSET_PINS_FILE:-}
+      EMBED_MODEL: ${EMBED_MODEL:-all-MiniLM-L6-v2}
+      ENABLE_ADAPTER_HOTSET_MANIFEST: ${ENABLE_ADAPTER_HOTSET_MANIFEST:-false}
+      ENABLE_CONFORMAL_CALIBRATION: ${ENABLE_CONFORMAL_CALIBRATION:-false}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+      # <<< generated
     volumes:
       - connected-ai-authority:/var/lib/gostly/connected-ai:ro
       - gostly-data:/data
@@ -456,7 +612,7 @@ services:
           memory: 12G
 
   ghost-proxy:
-    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/proxy@sha256:d614b119ac4380aaaa0142c63071bfc3e0ebc63340cb1dbba45dcf3e777e1aec
+    image: 242201285974.dkr.ecr.us-east-1.amazonaws.com/gostlyai/proxy@sha256:b6a8fa17deedcb6c3d58e5e59b84b4afd3692547cf03999756089321ee140611
     container_name: ghost-proxy
     # No privilege gain after start, and no Linux capabilities.
     security_opt:
@@ -482,6 +638,24 @@ services:
       REDACT_HEADERS:          ${REDACT_HEADERS:-Authorization,Cookie,X-Api-Key}
       API_URL:                 http://ghost-web:8000
       TRAFFIC_LOG_DIR:         /data/traffic
+      # Inbound webhook and WebSocket-frame capture, one JSONL per service. It
+      # must be on the data volume and match ghost-web's WEBHOOK_DIR: unset, the
+      # agent falls back to data/webhooks under /app, which it cannot create.
+      WEBHOOK_DIR:             /data/webhooks
+      # Optional wide events, off by default (ghost-web's list says how to turn
+      # them on). Like WEBHOOK_DIR, on the data volume and the same as ghost-web.
+      ENABLE_OBSERVABILITY:    ${ENABLE_OBSERVABILITY:-true}
+      WIDE_EVENTS_DIR:         /data/wide_events
+      # WebSocket frame capture (both WebSocket lanes), off by default. Set
+      # ENABLE_WS_CAPTURE=true in .env to write each routed service's frames to
+      # WEBHOOK_DIR. Frames have no per-frame redaction, so /health then
+      # reports capture.redacted_at_rest=false.
+      ENABLE_WS_CAPTURE:       ${ENABLE_WS_CAPTURE:-false}
+      # Smart-swap shadow comparison, on by default: a request smart swap
+      # answers is compared in the background with the cached AI response for
+      # it, and that generation is requested when none is cached. Set
+      # GOSTLY_CASCADE_SHADOW=0 in .env to turn both off.
+      GOSTLY_CASCADE_SHADOW:   ${GOSTLY_CASCADE_SHADOW:-1}
       # Telemetry opt-out passthrough — set GOSTLY_TELEMETRY=off in .env to
       # disable the shipper entirely (see .env.example).
       GOSTLY_TELEMETRY:        ${GOSTLY_TELEMETRY:-}
@@ -496,6 +670,34 @@ services:
       CHAOS_SEED:              ${CHAOS_SEED:-}
       TRAJECTORY_DIR:          /data/trajectories
       SNAPSHOT_ARTIFACT_DIR:   /data/snapshots
+      # >>> generated by api/tests/_configuration_catalogue.py sync: the operator settings this service reads
+      ENABLE_RAG: ${ENABLE_RAG:-true}
+      ENABLE_TLS_INTERCEPTION: ${ENABLE_TLS_INTERCEPTION:-false}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      GOSTLY_AGENT_ID: ${GOSTLY_AGENT_ID:-}
+      GOSTLY_EGRESS_STRICT: ${GOSTLY_EGRESS_STRICT:-false}
+      GOSTLY_EPISODE_TTL_SECS: ${GOSTLY_EPISODE_TTL_SECS:-3600}
+      GOSTLY_LICENSE_REVALIDATE_SECS: ${GOSTLY_LICENSE_REVALIDATE_SECS:-300}
+      GOSTLY_MAX_EXECUTION_JOURNAL_BYTES: ${GOSTLY_MAX_EXECUTION_JOURNAL_BYTES:-268435456}
+      GOSTLY_MAX_LIVE_EPISODES: ${GOSTLY_MAX_LIVE_EPISODES:-64}
+      GOSTLY_MAX_SNAPSHOTS: ${GOSTLY_MAX_SNAPSHOTS:-64}
+      GOSTLY_OUTBOUND_ALLOWED_ORIGINS: ${GOSTLY_OUTBOUND_ALLOWED_ORIGINS:-}
+      GOSTLY_SNAPSHOT_TTL_SECS: ${GOSTLY_SNAPSHOT_TTL_SECS:-86400}
+      GOSTLY_TELEMETRY_TIER: ${GOSTLY_TELEMETRY_TIER:-}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MAX_BODY_BYTES: ${MAX_BODY_BYTES:-1048576}
+      MOCK_PERSIST_VERBATIM: ${MOCK_PERSIST_VERBATIM:-false}
+      MOCK_SESSION_MAX_BYTES: ${MOCK_SESSION_MAX_BYTES:-268435456}
+      MOCK_SESSION_MAX_ENTRIES: ${MOCK_SESSION_MAX_ENTRIES:-10000}
+      MOCK_SESSION_MAX_ENTRIES_TOTAL: ${MOCK_SESSION_MAX_ENTRIES_TOTAL:-10000}
+      SMART_SWAP_ENABLED: ${SMART_SWAP_ENABLED:-false}
+      TLS_CACHE_SIZE: ${TLS_CACHE_SIZE:-8192}
+      TLS_CACHE_TTL_DAYS: ${TLS_CACHE_TTL_DAYS:-7}
+      TLS_PRELOAD_HOSTS: ${TLS_PRELOAD_HOSTS:-}
+      WEBHOOK_CAPTURE_TOKEN: ${WEBHOOK_CAPTURE_TOKEN:-}
+      WEBHOOK_PERSIST_VERBATIM: ${WEBHOOK_PERSIST_VERBATIM:-false}
+      # <<< generated
     volumes:
       - gostly-data:/data
     depends_on:
@@ -513,9 +715,9 @@ services:
       start_period: 20s
 
   # Bundled demo upstream, so a first install can record and replay without a
-  # service of its own. It starts only when the demo profile is active; the
-  # downloaded .env does that with COMPOSE_PROFILES=demo, next to the
-  # BACKEND_URL that points at it, so the two always change together. No other
+  # service of its own. It starts only when the demo profile is active; a
+  # fresh .env (from .template.env) does that with COMPOSE_PROFILES=demo, next
+  # to the BACKEND_URL that points at it, so the two always change together. No other
   # service waits on it and it publishes no port. It answers only under the
   # PREFIX path (404 elsewhere), so every demo request, capture and mock path
   # starts with /gostly-demo/ and never matches your own service's paths; the
@@ -540,6 +742,10 @@ volumes:
   # Only the API can publish connected AI authority; AI mounts it read-only.
   connected-ai-authority:
   postgres-data:
+  # The secret-store key (GOSTLY_SECRET_STORE_KEY_FILE): only ghost-web and
+  # ghost-migrate mount it. Docker creates it from the web image's
+  # /var/lib/gostly/secret-store, so it starts owned by UID 10001, mode 0700.
+  secret-store:
   # Recordings, mocks, the service key and adapters. Docker creates it from
   # the first mounting image's /data: ghost-migrate (the web image) runs
   # before every other user, so it starts owned by UID 10001 (#1296).

@@ -6,21 +6,28 @@
 #   ./setup.sh --help
 #
 # Each step is skipped when it is already done, so a second run changes nothing in .env:
-#   1. .env      copied from .template.env when missing (mode 0600)
-#   2. secrets   the three database passwords and GHOST_API_KEY, generated here once, never
+#   1. .env      copied from .template.env when missing (mode 0600); on an update, a rollout
+#                gate an older template wrote as false is turned on (printed)
+#   2. checks    before anything is asked for: Docker reachable, Compose and Engine versions,
+#                the dashboard, API and proxy ports free (skipped with --no-start), and no
+#                exported shell variable that Compose would take over a value in .env
+#   3. stack     Lite or Full, asked once and kept in COMPOSE_FILE; then the memory and disk
+#                that stack needs
+#   4. secrets   the three database passwords and GHOST_API_KEY, generated here once, never
 #                replaced and never printed (a new database password would lock the stack out
 #                of its existing volume; a deleted GHOST_API_KEY line stays deleted)
-#   3. account   the admin email and password and your licence key, asked for when empty; the
+#   5. account   the admin email and password and your license key, asked for when empty; the
 #                key and the password are typed without echo, never pass through argv, and a
 #                password you choose is never printed
-#   4. key       checked once at gostly.ai, which also gives the Workspace ID written to
-#                GOSTLY_TENANT_ID; a tenant already set is never replaced
-#   5. stack     Lite or Full, asked once and kept in COMPOSE_FILE
-#   6. images    only when an image is missing: a 12-hour registry token fetched from gostly.ai
-#                with the licence key and handed to docker login on its standard input (the
+#   6. key       checked at gostly.ai on every run. A fresh install writes the key's Workspace
+#                ID to GOSTLY_TENANT_ID; an installation that already has data keeps the tenant
+#                its data is under; a tenant already set is never replaced
+#   7. images    only when an image is missing: a 12-hour registry token fetched from gostly.ai
+#                with the license key and handed to docker login on its standard input (the
 #                registry login command from the dashboard is asked for only when that fails),
 #                then docker compose pull for the missing images
-#   7. start     docker compose up -d, then a wait for the containers to report healthy
+#   8. start     docker compose up -d, then a wait until every enabled service is running (and
+#                healthy where it has a health check) and the one-shot migration has finished
 # A password generated here is printed once, when the script finishes or stops; it stays in .env.
 # Exit status: 0 done, 1 refused or failed (the message says why), 2 usage.
 
@@ -32,27 +39,48 @@ PLATFORM_URL=${GOSTLY_PLATFORM_URL:-https://gostly.ai}
 DASHBOARD_URL="https://gostly.ai/dashboard"
 WAIT_SECONDS=${GOSTLY_SETUP_WAIT_SECONDS:-240}
 POLL_SECONDS=${GOSTLY_SETUP_POLL_SECONDS:-5}
-# The registry route allows 5 calls a minute per address: one retry after this many seconds.
+# The registry route limits calls per address and per license key: one retry after this many seconds.
 RETRY_SECONDS=${GOSTLY_SETUP_RETRY_SECONDS:-60}
 FULL_FILE=docker-compose.full.yaml
 LITE_FILE=docker-compose.yaml
 SECRETS="POSTGRES_PASSWORD GOSTLY_APP_DB_PASSWORD GOSTLY_SERVICE_DB_PASSWORD GHOST_API_KEY"
+# The rollout gates an update turns on when an older template wrote them as false.
+GATES="ACTIVITIES_V2_ENABLED GOSTLY_SHARED_EPISODE_MUTATIONS_ENABLED TRAINING_VERSION_ARCHIVE_ENABLED GOSTLY_RECEIPT_TRANSITION_WORKER"
 # Every key this script writes; each must appear at most once in .env.
 WRITTEN="$SECRETS GOSTLY_ADMIN_EMAIL GOSTLY_ADMIN_PASSWORD GOSTLY_LICENSE_KEY GOSTLY_TENANT_ID COMPOSE_FILE"
-# Docker info MemTotal at or above this (bytes) makes Full the suggested stack.
+# Values Docker Compose takes from the shell before .env: an exported one that differs from .env
+# would start a stack with values other than the ones this script checks and prints (the ports
+# included: an exported port would be published instead of the one probed).
+SHELL_CHECKED="GOSTLY_LICENSE_KEY GOSTLY_ADMIN_EMAIL GOSTLY_ADMIN_PASSWORD GOSTLY_TENANT_ID COMPOSE_FILE GOSTLY_WEB_PORT GOSTLY_PROXY_PORT"
+# Docker Compose: pull --policy missing needs 2.22. The Full file mounts a volume subpath, which
+# Compose passes to the engine from 2.26 and the engine supports from Docker Engine 26.
+COMPOSE_MIN=2.22
+FULL_COMPOSE_MIN=2.26
+FULL_ENGINE_MIN=26
+# Docker memory (bytes) below which the Full stack gets a warning: its AI containers are limited
+# to 12 GiB and 6 GiB by default (docker-compose.full.yaml), plus the Lite services.
 FULL_MEMORY=20000000000
+# Images on disk, in GB, as Docker reported them for the images pinned on 2026-10-20 (linux/arm64;
+# README.md, Lite or Full). Below this much free space a download gets a warning.
+LITE_DISK_GB=2
+FULL_DISK_GB=22
+# Services that run once and exit 0 when done; every other enabled service must keep running.
+ONE_SHOT="ghost-migrate"
+# The volume that holds the database, as named in the Compose files.
+DATA_VOLUME_NAME=postgres-data
 ENV_FILE=.env
 
 usage() {
   cat <<'EOF'
 Usage: ./setup.sh [--no-start] [--skip-key-check] [--non-interactive]
 
-Completes .env, checks your licence key at gostly.ai, signs in to the Gostly registry when an
-image is missing, and starts the stack. Run it again after git pull to update.
+Checks Docker, completes .env, checks your license key at gostly.ai, signs in to the Gostly
+registry when an image is missing, and starts the stack. Run it again after git pull to update.
 
-  --no-start          stop once .env is complete; pull and start nothing
+  --no-start          stop once .env is complete; check, pull and start nothing
   --skip-key-check    do not check the key at gostly.ai (GOSTLY_TENANT_ID is then not filled,
-                      and an empty key is accepted: the stack runs unlicensed)
+                      and an empty key is accepted: the stack runs unlicensed). Use it to start
+                      an installed stack without a connection.
   --non-interactive   never prompt; list the values .env still needs and exit 1 instead
   -h, --help          show this help
 EOF
@@ -99,8 +127,8 @@ restore_tty() {
 }
 TMP_FILES=""
 # Set once a password generated in this run is in .env, cleared once it has been printed: a run
-# that stops after writing it (Docker down, a failed pull or start, a health timeout) still shows
-# it, exactly once, on the way out.
+# that stops after writing it (a failed pull or start, a health timeout) still shows it,
+# exactly once, on the way out.
 PASSWORD_UNSHOWN=0
 password_notice() {
   if [ "$PASSWORD_UNSHOWN" -eq 1 ]; then
@@ -197,6 +225,24 @@ write_env() {
   mv "$tmp" "$ENV_FILE"
 }
 
+# check_shell_values: refuse when a variable in SHELL_CHECKED is set in this shell's environment
+# with a value other than the one in .env. Docker Compose takes the shell's value first, so the
+# stack would run with values this script never checked. The values are never printed.
+check_shell_values() {
+  conflicts=""
+  for key in $SHELL_CHECKED; do
+    is_set=""
+    eval "is_set=\${$key+set}"
+    [ "$is_set" = set ] || continue
+    eval "shell_value=\${$key}"
+    [ "$shell_value" = "$(value_of "$key")" ] || conflicts="$conflicts $key"
+  done
+  shell_value=""
+  if [ -n "$conflicts" ]; then
+    die "this shell exports$conflicts with a value other than the one in .env, and Docker Compose would use the shell's value (values not shown). Run: unset$conflicts (or open a new terminal), then run ./setup.sh again"
+  fi
+}
+
 # ── 1. .env ───────────────────────────────────────────────────────────────────
 if [ -L "$ENV_FILE" ]; then
   die "$ENV_FILE is a symbolic link; replace it with the real file and run again"
@@ -213,8 +259,202 @@ for key in $WRITTEN; do
     die "$ENV_FILE has $count $key= lines; keep exactly one (Compose uses the last) and run again"
   fi
 done
+# The rollout gates are on by default from 2026.11.0. An .env an older template wrote holds
+# them as false; this step turns each one on. To keep one off, set it to 0, which every gate
+# also reads as off and this step leaves alone.
+for key in $GATES; do
+  if [ "$(value_of "$key")" = false ]; then
+    eval "SU_V_$key=true"
+    write_env "$key"
+    say "$key=false -> $key=true in .env (on by default from 2026.11.0; set $key=0 to keep it off)"
+  fi
+done
 
-# ── 2. Local secrets ──────────────────────────────────────────────────────────
+# ── 2. Checks before anything is asked for ────────────────────────────────────
+check_shell_values
+
+# version_at_least HAVE NEED: HAVE (such as v2.29.1-desktop.1) is at least NEED (major or
+# major.minor). A HAVE with no readable version passes: the docker command reports its own errors.
+version_at_least() {
+  have=${1#v}
+  have_major=${have%%.*}
+  have_rest=${have#"$have_major"}
+  have_rest=${have_rest#.}
+  have_minor=${have_rest%%[!0-9]*}
+  [ -n "$have_minor" ] || have_minor=0
+  need_major=${2%%.*}
+  need_minor=0
+  case "$2" in *.*) need_minor=${2#*.} ;; esac
+  case "$have_major" in "" | *[!0-9]*) return 0 ;; esac
+  [ "$have_major" -gt "$need_major" ] && return 0
+  [ "$have_major" -eq "$need_major" ] && [ "$have_minor" -ge "$need_minor" ]
+}
+
+# compose_project: the Compose project name for this directory, read without interpolating
+# .env (which may not be complete yet), so nothing in .env is ever printed.
+compose_project() {
+  docker compose config --no-interpolate 2>/dev/null | sed -n 's/^name: //p' | head -n 1
+}
+
+# running_container SERVICE: the id of this project's running container for SERVICE, if any.
+# Exits 1 when docker ps itself fails, so "Docker could not list" is never read as "not running".
+running_container() {
+  [ -n "$PROJECT" ] || return 0
+  # Captured before trimming: in a pipeline the status would be head's, not Docker's.
+  ids=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" \
+    --filter "label=com.docker.compose.service=$1" --filter status=running 2>/dev/null) || return 1
+  printf '%s\n' "$ids" | sed -n 1p
+}
+
+# port_in_use PORT: something accepts connections on 127.0.0.1:PORT (curl exit 7 is "refused").
+# --noproxy '*': curl honours http_proxy and all_proxy, and a proxy that answers would make a
+# free port read as busy.
+port_in_use() {
+  probe=0
+  curl -q -s -o /dev/null --noproxy '*' --connect-timeout 2 --max-time 3 "http://127.0.0.1:$1/" 2>/dev/null || probe=$?
+  [ "$probe" -ne 7 ]
+}
+
+# effective_port NAME DEFAULT: the host port Compose publishes for ${NAME:-DEFAULT}.
+effective_port() {
+  port=$(value_of "$1")
+  [ -n "$port" ] || port=$2
+  printf '%s' "$port"
+}
+
+DOCKER_OK=0
+DOCKER_OS=""
+DOCKER_ROOT=""
+DOCKER_MEMORY=""
+ENGINE_VERSION=""
+COMPOSE_VERSION=""
+PROJECT=""
+if [ "$NO_START" -eq 0 ]; then
+  command -v docker >/dev/null 2>&1 || die "docker is not installed; install Docker with Compose v$COMPOSE_MIN or later and run ./setup.sh again"
+  context=$(docker context show 2>/dev/null || true)
+  info=$(docker info --format '{{.ServerVersion}}|{{.OperatingSystem}}|{{.MemTotal}}|{{.DockerRootDir}}' 2>/dev/null) ||
+    die "Docker is not running, or this user cannot reach it (Docker context ${context:-default}); start Docker and run ./setup.sh again"
+  ENGINE_VERSION=${info%%|*}
+  info=${info#*|}
+  DOCKER_OS=${info%%|*}
+  info=${info#*|}
+  DOCKER_MEMORY=${info%%|*}
+  DOCKER_ROOT=${info#*|}
+  DOCKER_OK=1
+  COMPOSE_VERSION=$(docker compose version --short 2>/dev/null) ||
+    die "Docker Compose v2 (the docker compose command) is missing; install Compose v$COMPOSE_MIN or later and run ./setup.sh again"
+  if ! version_at_least "$COMPOSE_VERSION" "$COMPOSE_MIN"; then
+    die "Docker Compose $COMPOSE_VERSION is too old: setup.sh needs Compose $COMPOSE_MIN or later. Update Docker and run ./setup.sh again"
+  fi
+  say "Docker: engine $ENGINE_VERSION on $DOCKER_OS (context ${context:-default}), Compose $COMPOSE_VERSION."
+
+  PROJECT=$(compose_project)
+  # The ports Compose publishes. This installation's own running containers hold theirs already.
+  web_port=$(effective_port GOSTLY_WEB_PORT 3000)
+  proxy_port=$(effective_port GOSTLY_PROXY_PORT 8080)
+  ports=""
+  if [ -z "$(running_container ghost-web)" ]; then
+    ports="$web_port:GOSTLY_WEB_PORT 8000:API"
+  fi
+  if [ -z "$(running_container ghost-proxy)" ]; then
+    ports="$ports $proxy_port:GOSTLY_PROXY_PORT"
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    say "Ports: not checked (curl is not installed)."
+  else
+    busy=""
+    for entry in $ports; do
+      if port_in_use "${entry%%:*}"; then
+        busy="$busy, port ${entry%%:*} (${entry#*:})"
+      fi
+    done
+    if [ -n "$busy" ]; then
+      die "another program is using${busy#,}. Stop it, or choose other ports with GOSTLY_WEB_PORT and GOSTLY_PROXY_PORT in .env (port 8000 must stay free; see A port is in use in README.md), and run ./setup.sh again"
+    fi
+  fi
+fi
+
+# missing_images [--no-interpolate]: the images of the configured stack not on this machine.
+# Before .env is complete, Compose can only render the files without interpolation, and then
+# config --images fails on the ${GOSTLY_WEB_PORT:-3000}:3000 port strings, so the image lines of
+# the rendered files are read instead (the images are pinned literally, never interpolated).
+missing_images() {
+  if [ "${1:-}" = --no-interpolate ]; then
+    listed=$(docker compose config --no-interpolate | sed -n 's/^[[:space:]]*image:[[:space:]]*//p') || return 1
+  else
+    listed=$(docker compose config --images) || return 1
+  fi
+  for image in $listed; do
+    docker image inspect "$image" >/dev/null 2>&1 || printf '%s\n' "$image"
+  done
+}
+
+# ── 3. Lite or Full ───────────────────────────────────────────────────────────
+if [ -z "$(value_of COMPOSE_FILE)" ] && [ -f "$FULL_FILE" ] && [ "$INTERACTIVE" -eq 1 ]; then
+  say "Lite runs the proxy, the dashboard and PostgreSQL: record traffic and replay it as mocks."
+  say "Full adds the AI services that generate mocks: a much larger download, and Docker memory for"
+  say "their limits (about 20 GB). See Lite or Full in README.md."
+  ask "Lite or Full? [lite]: "
+  choice=$(trim "$ANSWER" | tr '[:upper:]' '[:lower:]')
+  [ -n "$choice" ] || choice=lite
+  case "$choice" in
+    full | f) chosen_file=$FULL_FILE ;;
+    lite | l) chosen_file=$LITE_FILE ;;
+    *) die "answer lite or full" ;;
+  esac
+  # The choice is written either way, so a later run never asks again or switches silently.
+  # Setting COMPOSE_FILE turns off the automatic docker-compose.override.yaml, so keep it listed.
+  for override in docker-compose.override.yaml docker-compose.override.yml; do
+    if [ -f "$override" ]; then
+      chosen_file="$chosen_file:$override"
+      break
+    fi
+  done
+  SU_V_COMPOSE_FILE=$chosen_file
+  write_env COMPOSE_FILE
+  say "COMPOSE_FILE=$chosen_file written to .env."
+fi
+
+if [ "$DOCKER_OK" -eq 1 ]; then
+  case ":$(value_of COMPOSE_FILE):" in
+    *":$FULL_FILE:"*) stack=full ;;
+    *) stack=lite ;;
+  esac
+  if [ "$stack" = full ]; then
+    if ! version_at_least "$COMPOSE_VERSION" "$FULL_COMPOSE_MIN" || ! version_at_least "$ENGINE_VERSION" "$FULL_ENGINE_MIN"; then
+      die "the Full stack needs Docker Compose $FULL_COMPOSE_MIN or later and Docker Engine $FULL_ENGINE_MIN or later (this machine has Compose $COMPOSE_VERSION, Engine $ENGINE_VERSION). Update Docker, or set COMPOSE_FILE=$LITE_FILE in .env for Lite, and run ./setup.sh again"
+    fi
+    case "$DOCKER_MEMORY" in
+      "" | *[!0-9]*) ;;
+      *)
+        if [ "$DOCKER_MEMORY" -lt "$FULL_MEMORY" ]; then
+          say "Warning: Docker has $((DOCKER_MEMORY / 1000000000)) GB of memory; the Full stack's AI containers may not start with less than about $((FULL_MEMORY / 1000000000)) GB. See The Full stack fails to start for memory in README.md."
+        fi
+        ;;
+    esac
+  fi
+  # Disk: only a native engine's data directory can be measured from here.
+  if [ -n "$(missing_images --no-interpolate 2>/dev/null || true)" ]; then
+    need_gb=$LITE_DISK_GB
+    [ "$stack" = lite ] || need_gb=$FULL_DISK_GB
+    case "$DOCKER_OS" in
+      "Docker Desktop"*) free_kb="" ;;
+      *) free_kb=$(df -Pk "$DOCKER_ROOT" 2>/dev/null | awk 'NR == 2 { print $4 }') ;;
+    esac
+    case "$free_kb" in
+      "" | *[!0-9]*)
+        say "Disk: not checked (Docker keeps its images where this script cannot measure; the $stack images take about $need_gb GB)."
+        ;;
+      *)
+        if [ "$free_kb" -lt $((need_gb * 1000000)) ]; then
+          say "Warning: only $((free_kb / 1000000)) GB free under $DOCKER_ROOT; the $stack images take about $need_gb GB."
+        fi
+        ;;
+    esac
+  fi
+fi
+
+# ── 4. Local secrets ──────────────────────────────────────────────────────────
 random_hex() {
   od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
 }
@@ -255,7 +495,7 @@ if [ -n "$FILL" ]; then
   done
 fi
 
-# ── 3. Account values ─────────────────────────────────────────────────────────
+# ── 5. Account values ─────────────────────────────────────────────────────────
 # Collected first and written together once the key is accepted, so a refused key leaves no
 # generated password behind that was never shown.
 MISSING=""
@@ -323,13 +563,13 @@ LICENSE_KEY=$(value_of GOSTLY_LICENSE_KEY)
 KEY_FROM_PROMPT=0
 if [ -z "$LICENSE_KEY" ]; then
   if [ "$INTERACTIVE" -eq 1 ]; then
-    ask_hidden "Licence key (SPK_..., from $DASHBOARD_URL; it is not shown as you paste): "
+    ask_hidden "License key (SPK_..., from $DASHBOARD_URL; it is not shown as you paste): "
     LICENSE_KEY=$(printf '%s' "$ANSWER" | tr -d '[:space:]')
     KEY_FROM_PROMPT=1
   fi
   if [ -z "$LICENSE_KEY" ] && [ "$SKIP_KEY_CHECK" -eq 0 ]; then
     if [ "$INTERACTIVE" -eq 1 ]; then
-      die "a licence key is required: create one at $DASHBOARD_URL and run ./setup.sh again"
+      die "a license key is required: create one at $DASHBOARD_URL and run ./setup.sh again"
     fi
     MISSING="$MISSING GOSTLY_LICENSE_KEY"
   fi
@@ -337,10 +577,10 @@ fi
 if [ -n "$LICENSE_KEY" ]; then
   case "$LICENSE_KEY" in
     SPK_*) ;;
-    *) die "a Gostly licence key starts with SPK_; copy it again from $DASHBOARD_URL" ;;
+    *) die "a Gostly license key starts with SPK_; copy it again from $DASHBOARD_URL" ;;
   esac
   case "${LICENSE_KEY#SPK_}" in
-    "" | *[!A-Za-z0-9_-]*) die "that licence key has characters a Gostly key never has; copy it again from $DASHBOARD_URL" ;;
+    "" | *[!A-Za-z0-9_-]*) die "that license key has characters a Gostly key never has; copy it again from $DASHBOARD_URL" ;;
   esac
 fi
 
@@ -348,13 +588,83 @@ if [ -n "$MISSING" ]; then
   die "still empty in .env:$MISSING. Set them, or run ./setup.sh in a terminal to be asked"
 fi
 
-# ── 4. Key check ──────────────────────────────────────────────────────────────
+# ── 6. Key check ──────────────────────────────────────────────────────────────
 # POST /v1/license/features takes the key in a JSON body and records no seat. 200 with an org_id
 # is a recognised key; 200 with org_id null is an unknown or revoked key; 402 is a lapsed trial or
-# subscription; the route allows 60 calls a minute per address.
+# subscription; the route allows 60 calls a minute per address. It runs on every run, so a key
+# replaced in .env since the last run is checked before anything starts.
 TENANT=$(value_of GOSTLY_TENANT_ID)
+
+# existing_data: sets DATA_STATE to found (this project's database volume exists), none (Docker
+# listed this project's volumes and that one is not among them), or unknown (Docker could not be
+# asked, or the listing failed), DATA_UNKNOWN to why, and DATA_VOLUME to the volume's name. Only a
+# listing that succeeded can be none: a failed one is never read as a directory without data.
+existing_data() {
+  DATA_STATE=unknown
+  DATA_UNKNOWN="Docker cannot be reached"
+  DATA_VOLUME=""
+  command -v docker >/dev/null 2>&1 || return 0
+  if [ "$DOCKER_OK" -eq 0 ]; then
+    docker info >/dev/null 2>&1 || return 0
+    PROJECT=$(compose_project)
+  fi
+  DATA_UNKNOWN="docker compose could not name this directory's project"
+  [ -n "$PROJECT" ] || return 0
+  # Docker's exit status is kept before the output is trimmed: in a pipeline it would be head's.
+  DATA_UNKNOWN="docker volume ls failed"
+  volumes=$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT" \
+    --filter "label=com.docker.compose.volume=$DATA_VOLUME_NAME" 2>/dev/null) || return 0
+  DATA_UNKNOWN=""
+  DATA_VOLUME=$(printf '%s\n' "$volumes" | sed -n 1p)
+  if [ -n "$DATA_VOLUME" ]; then DATA_STATE=found; else DATA_STATE=none; fi
+}
+
+# sha256_16: the first 16 hex characters of the SHA-256 of standard input.
+sha256_16() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 -r
+  fi | cut -c1-16
+}
+
+# resolved_tenant: the tenant an installation without GOSTLY_TENANT_ID keeps its data under.
+# A running ghost-web answers for itself (the command in Gostly's license key rotation runbook);
+# otherwise the API's own rule applies: the key in .env, as sha256(key)[:16], or "default" for
+# an installation that had no key. Prints nothing when docker ps fails: a running ghost-web
+# that would answer otherwise cannot be ruled out, so no fallback is guessed.
+resolved_tenant() {
+  container=$(running_container ghost-web) || return 0
+  if [ -n "$container" ]; then
+    # A docker exec that fails answers nothing, whatever it printed: its status is kept, not tail's.
+    answer=$(docker exec -w /app/api "$container" python3 -c \
+      'from deps import _resolve_tenant_id; print(_resolve_tenant_id())' 2>/dev/null) || answer=""
+    answer=$(printf '%s\n' "$answer" | tail -n 1)
+    case "$answer" in
+      "" | [!A-Za-z0-9]* | *[!A-Za-z0-9._:@/-]*) ;;
+      *)
+        printf '%s' "$answer"
+        return 0
+        ;;
+    esac
+  fi
+  if [ "$KEY_FROM_PROMPT" -eq 1 ]; then
+    printf 'default'
+    return 0
+  fi
+  hash=$(printf '%s' "$LICENSE_KEY" | sha256_16)
+  case "$hash" in
+    *[!0-9a-f]*) return 0 ;;
+  esac
+  [ "${#hash}" -eq 16 ] && printf '%s' "$hash"
+}
+
 remove_key() {
-  if [ "$KEY_FROM_PROMPT" -eq 0 ]; then
+  # Only a key that a fresh install was just given: an installed .env keeps its key line, for the
+  # person to replace.
+  if [ "$KEY_FROM_PROMPT" -eq 0 ] && [ -z "$TENANT" ]; then
     SU_V_GOSTLY_LICENSE_KEY=""
     write_env GOSTLY_LICENSE_KEY
   fi
@@ -364,11 +674,9 @@ if [ -n "$LICENSE_KEY" ] && [ "$KEY_FROM_PROMPT" -eq 1 ]; then
   UPDATE="$UPDATE GOSTLY_LICENSE_KEY"
 fi
 if [ -z "$LICENSE_KEY" ]; then
-  say "No licence key: the stack runs unlicensed until you add one and run ./setup.sh again."
+  say "No license key: the stack runs unlicensed until you add one and run ./setup.sh again."
 elif [ "$SKIP_KEY_CHECK" -eq 1 ]; then
-  say "Licence key: not checked (--skip-key-check)."
-elif [ "$KEY_FROM_PROMPT" -eq 0 ] && [ -n "$TENANT" ]; then
-  say "Licence key and Workspace ID: already set, kept."
+  say "License key: not checked (--skip-key-check)."
 else
   command -v curl >/dev/null 2>&1 || die "curl is needed to check the key; install it, or run ./setup.sh --skip-key-check"
   body=$(mktemp "${TMPDIR:-/tmp}/gostly-setup.XXXXXX")
@@ -377,24 +685,45 @@ else
   status=$(printf '{"key": "%s"}' "$LICENSE_KEY" | curl -sS --connect-timeout 10 --max-time 30 \
     -o "$body" -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- \
     "$PLATFORM_URL/v1/license/features") || status="000"
+  replace_hint="create or rotate one at $DASHBOARD_URL"
+  [ -z "$TENANT" ] || replace_hint="put a key from $DASHBOARD_URL in GOSTLY_LICENSE_KEY in .env (keep GOSTLY_TENANT_ID) and run ./setup.sh again"
   case "$status" in
     200)
       org_id=$(tr -d '\n' <"$body" | sed -n 's/.*"org_id"[[:space:]]*:[[:space:]]*"\([0-9A-Za-z-]*\)".*/\1/p')
       if [ -z "$org_id" ]; then
         remove_key
-        die "gostly.ai does not recognise this key (mistyped, revoked, expired, or from another account); create or rotate one at $DASHBOARD_URL"
+        die "gostly.ai does not recognise this key (mistyped, revoked, expired, or from another account); $replace_hint"
       fi
-      if [ -z "$TENANT" ]; then
-        SU_V_GOSTLY_TENANT_ID=$org_id
-        UPDATE="$UPDATE GOSTLY_TENANT_ID"
-        say "Licence key: accepted. Workspace ID $org_id written to GOSTLY_TENANT_ID."
-      elif [ "$TENANT" != "$org_id" ]; then
-        say "Licence key: accepted. Warning: GOSTLY_TENANT_ID is $TENANT, not this key's workspace $org_id; kept as it is."
+      if [ -n "$TENANT" ]; then
+        if [ "$TENANT" = "$org_id" ]; then
+          say "License key: accepted."
+        else
+          say "License key: accepted, but this key belongs to workspace $org_id and this installation keeps its data under GOSTLY_TENANT_ID $TENANT, which stays as it is. If the key is from another account by mistake, replace it with one from that account."
+        fi
       else
-        say "Licence key: accepted."
+        existing_data
+        case "$DATA_STATE" in
+          none)
+            SU_V_GOSTLY_TENANT_ID=$org_id
+            UPDATE="$UPDATE GOSTLY_TENANT_ID"
+            say "License key: accepted. Workspace ID $org_id written to GOSTLY_TENANT_ID."
+            ;;
+          found)
+            kept=$(resolved_tenant)
+            if [ -z "$kept" ]; then
+              die "this directory already has Gostly data (Docker volume $DATA_VOLUME) but no GOSTLY_TENANT_ID, and setup.sh could not tell which tenant that data is under. Nothing more was written to .env: GOSTLY_TENANT_ID and this run's license key and account values are not saved. Start the stack as it is (docker compose up -d), then run ./setup.sh again; or follow Existing data and GOSTLY_TENANT_ID in README.md"
+            fi
+            SU_V_GOSTLY_TENANT_ID=$kept
+            UPDATE="$UPDATE GOSTLY_TENANT_ID"
+            say "License key: accepted. This directory already has Gostly data (Docker volume $DATA_VOLUME) from before GOSTLY_TENANT_ID was set, so GOSTLY_TENANT_ID is set to the tenant that data is under, $kept, not to the key's Workspace ID $org_id. Your existing data stays visible."
+            ;;
+          *)
+            say "License key: accepted. GOSTLY_TENANT_ID left empty: setup.sh could not list this directory's Docker volumes ($DATA_UNKNOWN), so it cannot tell whether this directory already has Gostly data, and it never picks a tenant for data it cannot see. Run ./setup.sh again once Docker answers (docker volume ls) to fill it."
+            ;;
+        esac
       fi
       ;;
-    402) die "this key's trial or subscription has ended; renew at https://gostly.ai" ;;
+    402) die "this key's trial or subscription has ended; renew at https://gostly.ai, or run ./setup.sh --skip-key-check to start without the check" ;;
     429) die "rate limited, try again in a minute" ;;
     *)
       die "could not check the key (HTTP $status from $PLATFORM_URL); check the connection, or run ./setup.sh --skip-key-check"
@@ -422,35 +751,8 @@ case "$UPDATE" in
     ;;
   *) SIGN_IN_PASSWORD="with the password in .env (GOSTLY_ADMIN_PASSWORD)" ;;
 esac
-
-# ── 5. Lite or Full ───────────────────────────────────────────────────────────
-if [ -z "$(value_of COMPOSE_FILE)" ] && [ -f "$FULL_FILE" ] && [ "$INTERACTIVE" -eq 1 ]; then
-  default=lite
-  memory=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
-  case "$memory" in
-    "" | *[!0-9]*) ;;
-    *) [ "$memory" -ge "$FULL_MEMORY" ] && default=full ;;
-  esac
-  ask "Full stack with the AI services, or Lite? [$default]: "
-  choice=$(trim "$ANSWER" | tr '[:upper:]' '[:lower:]')
-  [ -n "$choice" ] || choice=$default
-  case "$choice" in
-    full | f) chosen_file=$FULL_FILE ;;
-    lite | l) chosen_file=$LITE_FILE ;;
-    *) die "answer full or lite" ;;
-  esac
-  # The choice is written either way, so a later run never asks again or switches silently.
-  # Setting COMPOSE_FILE turns off the automatic docker-compose.override.yaml, so keep it listed.
-  for override in docker-compose.override.yaml docker-compose.override.yml; do
-    if [ -f "$override" ]; then
-      chosen_file="$chosen_file:$override"
-      break
-    fi
-  done
-  SU_V_COMPOSE_FILE=$chosen_file
-  write_env COMPOSE_FILE
-  say "COMPOSE_FILE=$chosen_file written to .env."
-fi
+# The values just written are the ones Compose must use too.
+check_shell_values
 
 if [ "$NO_START" -eq 1 ]; then
   say ".env is complete. Run ./setup.sh again to start Gostly."
@@ -462,14 +764,14 @@ if [ "$NO_START" -eq 1 ]; then
 fi
 
 # registry_login_with_key: sign in to the private registry with a 12-hour token that gostly.ai
-# issues for the licence key (GET /v1/license/registry-credentials). The key reaches curl in a
+# issues for the license key (GET /v1/license/registry-credentials). The key reaches curl in a
 # config read from its standard input (-K -), and the token reaches docker login on its standard
 # input, so neither is ever in a process argument list or a file. Sets logged_in=1 on success.
 # A refused key, a lapsed trial or a second rate limit stops the script; any other answer falls
 # back to the registry login command from the dashboard, with one line saying why.
 registry_login_with_key() {
   if [ -z "$LICENSE_KEY" ]; then
-    say "No licence key in .env, so the registry sign-in cannot be fetched from gostly.ai."
+    say "No license key in .env, so the registry sign-in cannot be fetched from gostly.ai."
     return 0
   fi
   if ! command -v curl >/dev/null 2>&1; then
@@ -494,7 +796,7 @@ registry_login_with_key() {
           sleep "$RETRY_SECONDS"
           continue
         fi
-        die "gostly.ai is still rate limiting registry sign-ins (5 a minute, 20 an hour per address); wait a few minutes and run ./setup.sh again"
+        die "gostly.ai is still rate limiting registry sign-ins for this address or this license key; wait a few minutes and run ./setup.sh again"
         ;;
     esac
     break
@@ -521,11 +823,11 @@ registry_login_with_key() {
       fi
       token=""
       logged_in=1
-      say "Registry: signed in to $login_registry with your licence key (valid for 12 hours)."
+      say "Registry: signed in to $login_registry with your license key (valid for 12 hours)."
       ;;
     401)
       body=""
-      die "gostly.ai did not accept this licence key for the image registry (mistyped, revoked, expired, or from another account). Create or rotate a key at $DASHBOARD_URL, replace GOSTLY_LICENSE_KEY in .env (keep GOSTLY_TENANT_ID) and run ./setup.sh again"
+      die "gostly.ai did not accept this license key for the image registry (mistyped, revoked, expired, or from another account). Create or rotate a key at $DASHBOARD_URL, replace GOSTLY_LICENSE_KEY in .env (keep GOSTLY_TENANT_ID) and run ./setup.sh again"
       ;;
     402)
       body=""
@@ -540,26 +842,20 @@ registry_login_with_key() {
 NL='
 '
 
-# ── 6. Images ─────────────────────────────────────────────────────────────────
-command -v docker >/dev/null 2>&1 || die "docker is not installed; install Docker with Compose v2 and run ./setup.sh again"
-docker info >/dev/null 2>&1 || die "Docker is not running; start it and run ./setup.sh again"
-images=$(docker compose config --images) || die "docker compose could not read the Compose file and .env (the message above names the problem)"
-missing_images=""
+# ── 7. Images ─────────────────────────────────────────────────────────────────
+missing=$(missing_images) || die "docker compose could not read the Compose file and .env (the message above names the problem)"
 registry=""
-for image in $images; do
+for image in $(docker compose config --images); do
   case "$image" in
     */gostlyai/*) registry=${image%%/*} ;;
   esac
-  if ! docker image inspect "$image" >/dev/null 2>&1; then
-    missing_images="$missing_images $image"
-  fi
 done
 
-if [ -z "$missing_images" ]; then
+if [ -z "$missing" ]; then
   say "Images: all present, no download needed."
 else
   needs_login=0
-  for image in $missing_images; do
+  for image in $missing; do
     case "$image" in
       */gostlyai/*) needs_login=1 ;;
     esac
@@ -598,12 +894,15 @@ else
   fi
 fi
 
-# ── 7. Start and wait ─────────────────────────────────────────────────────────
+# ── 8. Start and wait ─────────────────────────────────────────────────────────
+expected=$(docker compose config --services) || die "docker compose could not list the services (the message above names the problem)"
 docker compose up -d || die "docker compose up failed; see the message above, then docker compose ps -a and docker compose logs"
 
 # One line per container: service|state|health|exit code. A Go template, not JSON: the JSON rows
 # carry arrays (Publishers) that a line-oriented shell cannot split safely, and "|" is not
-# whitespace, so an empty health field stays a field.
+# whitespace, so an empty health field stays a field. Every enabled service must have a row:
+# a one-shot service must have exited 0, every other one must be running (and healthy when it
+# has a health check). A serving container that stopped, even with exit code 0, is a failure.
 PS_FORMAT='{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}'
 waited=0
 while :; do
@@ -611,23 +910,32 @@ while :; do
   ready=0
   waiting=""
   rows=$(docker compose ps -a --format "$PS_FORMAT" 2>/dev/null) || rows=""
-  while IFS='|' read -r service state health exit_code; do
-    [ -n "$service" ] || continue
+  for service in $expected; do
     total=$((total + 1))
-    case "$state:$health" in
-      running: | running:healthy) ready=$((ready + 1)) ;;
-      exited:*)
-        if [ "$exit_code" = 0 ]; then
-          ready=$((ready + 1))
-        else
-          die "$service exited with code $exit_code; see docker compose logs $service"
-        fi
+    row=$(printf '%s\n' "$rows" | grep "^$service|" | tail -n 1 || true)
+    if [ -z "$row" ]; then
+      waiting="$waiting $service (not created)"
+      continue
+    fi
+    row=${row#*|}
+    state=${row%%|*}
+    row=${row#*|}
+    health=${row%%|*}
+    exit_code=${row#*|}
+    one_shot=0
+    case " $ONE_SHOT " in *" $service "*) one_shot=1 ;; esac
+    case "$one_shot:$state:$health" in
+      0:running: | 0:running:healthy) ready=$((ready + 1)) ;;
+      1:exited:*)
+        [ "$exit_code" = 0 ] || die "$service exited with code $exit_code; see docker compose logs $service"
+        ready=$((ready + 1))
+        ;;
+      0:exited:* | 0:dead:*)
+        die "$service stopped (exit code $exit_code); see docker compose logs $service, then run ./setup.sh again"
         ;;
       *) waiting="$waiting $service ($state${health:+, $health})" ;;
     esac
-  done <<EOF
-$rows
-EOF
+  done
   if [ "$total" -gt 0 ] && [ "$ready" -eq "$total" ]; then
     break
   fi
