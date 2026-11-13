@@ -63,9 +63,9 @@ state.
 - **Check it took effect:** ghost-llamacpp starts with the published set, and fails its start when an adapter in it is missing or changed.
 - **Stack:** `docker-compose.full.yaml` only.
 
-#### Smart swap on a Free license
+#### Smart swap where the license leaves it off
 
-- **Why it is off:** A Free license serves exact matches only. This opts the proxy in to answering a near miss with the closest recorded mock; paid licenses turn smart swap on themselves, and the license still sets the ceiling.
+- **Why it is off:** Your license decides whether the proxy answers a near miss with the closest recorded mock. This opts the proxy in when the license leaves it off; every other feature still comes from the license.
 - **Tradeoffs:**
   - quality: a near miss gets a close recorded answer instead of the miss response, which can hide a recording you still need
 - **Turn it on:** `SMART_SWAP_ENABLED=true` in `.env`, then `docker compose up -d`.
